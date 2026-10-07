@@ -1,0 +1,22 @@
+# FNV-1a 64 of the tree's output on tests/vector_inputs.h inputs; regenerate with tree_harness --vectors
+seal D=128 bk=4 bv=4 body=0 bytes=17920 rec=ee9813f6f22b03a4 dec=b11506576bb29867
+seal D=128 bk=3 bv=3 body=1 bytes=13824 rec=504d4796353fa3ea dec=d909eb8c10ec7b43
+seal D=128 bk=3 bv=2 body=1 bytes=11776 rec=1e0a86a4ad53680f dec=9ba72edee1c5ad8f
+seal D=128 bk=2 bv=2 body=1 bytes=9728 rec=c63b6c18c63ab8b9 dec=0574dbef37bf2288
+seal D=128 bk=4 bv=3 body=0 bytes=15872 rec=c0fd0174a724eac9 dec=35c7f571d234f571
+seal D=128 bk=3 bv=3 body=0 bytes=13824 rec=7e94f57d41f04e5b dec=ade094f46b7d2bc9
+seal D=128 bk=4 bv=2 body=0 bytes=13824 rec=d7b3a16e9f678b7f dec=936b8bf7dffcef9b
+seal D=128 bk=2 bv=4 body=0 bytes=13824 rec=ac4f6916d9eff979 dec=a69b03d4db9f0f6e
+seal D=128 bk=3 bv=2 body=0 bytes=11776 rec=1c684d190982cdf1 dec=64a4decde9547cc3
+seal D=128 bk=2 bv=2 body=0 bytes=9728 rec=666849aebc22fd4e dec=d46a43fdbad9a76a
+seal D=256 bk=4 bv=4 body=0 bytes=35072 rec=6cd70d4d776a43b8 dec=3e72a04b41b03af9
+seal D=256 bk=3 bv=3 body=1 bytes=26880 rec=f7eafc50007113fd dec=419b35ae1d388425
+seal D=256 bk=3 bv=2 body=1 bytes=22784 rec=5c5b8edd8a06fe37 dec=bcb2744c5e87923e
+seal D=256 bk=2 bv=2 body=1 bytes=18688 rec=47075a62ce4c98a9 dec=f406e6b765c451ec
+seal D=256 bk=4 bv=3 body=0 bytes=30976 rec=3e3c2cd684c08811 dec=c1874a185df9b94d
+seal D=256 bk=3 bv=3 body=0 bytes=26880 rec=066f7a61e0f2c076 dec=835f5a35f0cb13fb
+seal D=256 bk=4 bv=2 body=0 bytes=26880 rec=5e5c11b4c63c7f74 dec=501642d89009d2eb
+seal D=256 bk=2 bv=4 body=0 bytes=26880 rec=326c72050328f787 dec=1a6de7ecc13555bd
+seal D=256 bk=3 bv=2 body=0 bytes=22784 rec=dbfd79d1cb5d0a97 dec=f753fb186c3119a1
+seal D=256 bk=2 bv=2 body=0 bytes=18688 rec=898d2785f345b23f dec=8e9e3a876d29867f
+tq6 rows=64 n=256 enc=e2cf2c357ef8de90 dec=de4f0c87393006e6
