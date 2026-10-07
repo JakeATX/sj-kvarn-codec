@@ -227,6 +227,9 @@ the harness):
 - **Real K/V from a model.** On 48 groups of agentic-task activations, 0 of 48 records
   differ in any of the 10 configs.
 
+- **CUDA.** `tests/test_cuda` builds for sm_86 but has not been run yet, because the test GPU was busy. The
+  CUDA kernels are unverified on the device.
+
 KL sanity check on real activations (one group at a time, synthetic peaked queries;
 mean KL in nats / relative error of the attention output):
 
