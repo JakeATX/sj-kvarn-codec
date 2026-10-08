@@ -508,10 +508,11 @@ static SJ_KVARN_HD double sj_kvarn__maxd(double a, double b) { return a < b ? b 
 static SJ_KVARN_HD float sj_kvarn__bits_f(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
 static SJ_KVARN_HD uint32_t sj_kvarn__f_bits(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
 
+/* The same integer/float code runs on host and device. The device intrinsic
+ * __float2half_rn gives the same value, but with CUDA 12.4 ptxas, a byte-wise
+ * memcpy of its result was compiled as a numeric conversion (F2I.U8.F16), so the
+ * low byte of every stored half was wrong. */
 SJKVARN_DEF SJ_KVARN_HD uint16_t sj_kvarn_f32_to_f16(float f) {
-#if defined(__CUDA_ARCH__)
-    return __half_as_ushort(__float2half_rn(f));
-#else
     /* exact round-to-nearest-even conversion (subnormals, overflow to inf) */
     const float scale_to_inf  = sj_kvarn__bits_f(UINT32_C(0x77800000));
     const float scale_to_zero = sj_kvarn__bits_f(UINT32_C(0x08800000));
@@ -529,7 +530,6 @@ SJKVARN_DEF SJ_KVARN_HD uint16_t sj_kvarn_f32_to_f16(float f) {
     const uint32_t man_bits = bits & UINT32_C(0x00000FFF);
     const uint32_t nonsign  = exp_bits + man_bits;
     return (uint16_t) ((sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT32_C(0x7E00) : nonsign));
-#endif
 }
 
 SJKVARN_DEF SJ_KVARN_HD float sj_kvarn_f16_to_f32(uint16_t h) {

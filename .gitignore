@@ -6,3 +6,4 @@ tests/test_cuda
 tests/tree_harness
 *.kvd
 *.o
+tests/tree_cuda_harness
