@@ -214,6 +214,7 @@ and `sj_kvarn_record_accum_v`, give you the exact values a kernel must reproduce
 |---|---|
 | `make check` | C99 build with `-std=c99 -Wall -Wextra -Wpedantic -Werror`. Also runs fp16 conversion, 21 bit-exact vectors (D = 128 and 256, 10 body configs, plus `tq6_0`), 6.7 million policy steps and the KL sanity test. |
 | `tests/build_tree_harness.sh <tree> <build>` then `tests/tree_harness [--kvd FILE]` | Runs a llama.cpp tree's own ggml CPU graph next to this library through the adaptive-tail schedule with a wrapping ring, and compares every byte. |
+| `tests/build_tree_harness.sh <tree> <build> cuda` then `tests/tree_cuda_harness` | Runs the tree's own CUDA staging and seal kernels and compares the bytes with this library. |
 | `tests/build_cuda_test.sh` then `tests/test_cuda` | Compares device and host on seal records, decode, staging and attention. |
 
 Results against the reference tree (CPU graph, D = 256, 2 KV heads, tail 256 to 512 in
@@ -227,8 +228,17 @@ the harness):
 - **Real K/V from a model.** On 48 groups of agentic-task activations, 0 of 48 records
   differ in any of the 10 configs.
 
-- **CUDA.** `tests/test_cuda` builds for sm_86 but has not been run yet, because the test GPU was busy. The
-  CUDA kernels are unverified on the device.
+- **CUDA, against this library's CPU code.** `tests/test_cuda` passes on an RTX 3090 Ti (sm_86,
+  CUDA 12.4). In 6 configs, 8 of 8 sealed records match byte for byte and 0 of 2,048 decoded rows
+  differ. The tq6_0 staging rows (2,400) match byte for byte. The attention output matches within
+  2.95e-7 relative.
+- **CUDA, against the tree's CUDA kernels.** `tests/tree_cuda_harness` runs the tree's own staging and
+  seal kernels. Given the same staged input, 0 of 8 records differ in all 10 configs, and 0 of 1,024
+  sink rows differ. The tree's CUDA staging differs from this library in 2 of 4,336 rows, by one unit
+  in the last place of the fp16 row norm. The tree builds its CUDA code with `-use_fast_math` and sums
+  the norm in warp order, while its CPU code (and this library) sums in sequence. This library matches
+  the tree's CPU staging exactly. The harness therefore copies those 2 rows across before checking the
+  seal, and still reports them.
 
 KL sanity check on real activations (one group at a time, synthetic peaked queries;
 mean KL in nats / relative error of the attention output):
@@ -272,8 +282,7 @@ None of these change the bytes of the formats that are included.
 
 **Not checked:**
 
-- The tree's own CUDA staging and seal kernels were not compared. The comparison here is
-  against its CPU reference.
+- Only the configs listed above were run on the device, on one GPU (sm_86).
 
 **Compared with KVarN itself:**
 
@@ -283,6 +292,8 @@ None of these change the bytes of the formats that are included.
 
 ## Limitations
 
+- **Body variants.** This general version leaves out the 4-bit trellis, the channel-axis trellis
+  and the tiered bodies.
 - **Seal speed.** The seal is a reference implementation. Single thread on a Ryzen 7
   5800X3D at `-O2`:
 
@@ -295,6 +306,8 @@ None of these change the bytes of the formats that are included.
   Decoding one K+V row takes 7.6 to 8.8 us. The adaptive tail seals in large batches, so
   this cost comes in occasional bursts. A production engine should seal on the GPU or on
   worker threads.
+- **Portability over speed.** The reference codec puts portability ahead of speed. Integrators' fused
+  kernels can be much faster.
 - **CUDA kernels.** They use one thread per record or per row. They exist to check the
   format on the device, not to run fast.
 - **Sequences.** One sequence per cache: the policy tracks a single position stream.
