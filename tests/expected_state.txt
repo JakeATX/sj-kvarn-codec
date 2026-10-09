@@ -1,0 +1,8 @@
+# FNV-1a 64 of the SJ-KVaRN sequence state stream (state version 1) of tests/test_state.c's 1500-position build.
+# These pin the serialized layout; the record bytes inside are pinned separately by expected_vectors.txt (tree hashes).
+# Regenerate (only when SJKVARN_STATE_VERSION changes) with: tests/test_state --print-golden
+state 4/4 v1 hash=b272bebf5862d3e9
+state 3/3 v1 hash=7ec40b7d9b5c7332
+state 3/3t v1 hash=f7b8ec682fcfe41f
+state 3/2t v1 hash=c24888a80cf17b52
+state 4/4f v1 hash=3df623364a3963f6

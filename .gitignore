@@ -1,6 +1,7 @@
 tests/test_fp16
 tests/test_kl
 tests/test_policy
+tests/test_state
 tests/test_vectors
 tests/test_cuda
 tests/tree_harness

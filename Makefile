@@ -1,7 +1,7 @@
 # Plain C99 build of the tests (no dependencies). The tree harness has its own script (tests/build_tree_harness.sh).
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic -Werror
-TESTS    = tests/test_vectors tests/test_policy tests/test_kl tests/test_fp16
+TESTS    = tests/test_vectors tests/test_policy tests/test_kl tests/test_fp16 tests/test_state
 
 all: $(TESTS)
 
@@ -13,8 +13,11 @@ check: all
 	./tests/test_vectors tests/expected_vectors.txt
 	./tests/test_policy
 	./tests/test_kl
+	./tests/test_state tests/expected_state.txt
+
+test: check
 
 clean:
 	rm -f $(TESTS) tests/tree_harness tests/tree_cuda_harness tests/test_cuda
 
-.PHONY: all check clean
+.PHONY: all check test clean

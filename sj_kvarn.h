@@ -59,8 +59,19 @@
  *             (sj_kvarn_layer_attend_row: sink -> fp16, [sink, B) -> body,
  *             [B, N) -> staging ring), and un-rotate the output with the same
  *             Hadamard (it is its own inverse).
- *   idle      optional: sj_kvarn_policy_idle(&pol, end) + seal + commit
- *             compresses a grown adaptive tail while the engine is idle.
+ *   idle      optional: sj_kvarn_policy_idle(&pol, end, keep_recent) + seal +
+ *             commit compresses a grown adaptive tail while the engine is idle,
+ *             never sealing the last max(keep_recent, tail) positions.
+ *   truncate  prompt caching: sj_kvarn_policy_truncate(&pol, p, &dropped) drops
+ *             the sealed groups at and after the group boundary at or below p
+ *             (only when p < B) and returns the position to re-prefill from
+ *             (p itself, or at most G-1 positions before it). No re-quantisation.
+ *   state     sj_kvarn_seq_state_size/_write/_read: versioned save and restore of
+ *             one sequence (sink, sealed records, tail rows, policy state).
+ *
+ * Every cache and policy object is PER SEQUENCE. sj_kvarn_seq bundles the
+ * layers, the policy and the stored end of one sequence; several sequences can
+ * share one paged record pool (sj_kvarn_pool) through per-sequence block tables.
  * ---------------------------------------------------------------------------
  *
  * MIT License. Copyright (c) 2026 Jake K. Full text at the end of this file.
@@ -71,9 +82,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SJKVARN_VERSION_MAJOR 1
+#define SJKVARN_VERSION_MAJOR 2  /* 2.0: policy_idle takes keep_recent; truncation, state, sequences, pool */
 #define SJKVARN_VERSION_MINOR 0
-#define SJKVARN_FORMAT_VERSION 1 /* bumps whenever stored bytes change */
+#define SJKVARN_FORMAT_VERSION 1 /* bumps whenever stored bytes (records, staging rows) change */
+#define SJKVARN_STATE_VERSION  1 /* bumps whenever the serialized sequence-state layout changes */
 
 #ifndef SJ_KVARN_HD
 #if defined(__CUDACC__)
@@ -210,6 +222,9 @@ SJKVARN_DEF void sj_kvarn_record_scores(const sj_kvarn_layout * l, const uint8_t
 SJKVARN_DEF void sj_kvarn_record_accum_v(const sj_kvarn_layout * l, const uint8_t * rec, const float * w, int n, float * acc);
 
 /* ---- adaptive tail / journal policy ---- */
+/* One policy per SEQUENCE: B, B_prev, B_pending and draining describe that
+ * sequence's own positions. A cache that holds several sequences keeps one
+ * policy per sequence (see sj_kvarn_seq). */
 typedef struct sj_kvarn_policy {
     uint32_t sink, tail, tail_max, group, flush_chunk; /* tail_max 0 = fixed tail */
     uint32_t B;          /* sealed end: positions [sink, B) are in the body           */
@@ -225,14 +240,42 @@ SJKVARN_DEF void     sj_kvarn_policy_reset(sj_kvarn_policy * p);
  * stored). Returns B_pending; seal [B, B_pending) and then call commit. */
 SJKVARN_DEF uint32_t sj_kvarn_policy_begin_ubatch(sj_kvarn_policy * p, uint32_t pos0, uint32_t n_tokens);
 SJKVARN_DEF void     sj_kvarn_policy_commit(sj_kvarn_policy * p);
-/* Idle compression: end = number of stored positions. Returns the new target
- * (B_pending) or B when there is nothing to seal. Seal [B, B_pending), commit. */
-SJKVARN_DEF uint32_t sj_kvarn_policy_idle(sj_kvarn_policy * p, uint32_t end);
+/* Idle compression: end = number of stored positions. The target is the group
+ * boundary at or below end - max(keep_recent, tail), so the last
+ * max(keep_recent, tail) positions are never sealed by an idle step (pass 0 for
+ * "the configured tail"; pass end - k to keep everything from position k on, e.g.
+ * the end of the last prompt, so a re-rendered last turn stays in the exact tail).
+ * Returns the new target (B_pending) or B when there is nothing to seal. Seal
+ * [B, B_pending), commit. Only acts with an adaptive tail (tail_max > 0). */
+SJKVARN_DEF uint32_t sj_kvarn_policy_idle(sj_kvarn_policy * p, uint32_t end, uint32_t keep_recent);
+
+/* ---- truncation (prompt caching) ---- */
+#define SJKVARN_NO_POS UINT32_MAX
+/* Group boundary at or below pos: pos itself when pos <= sink, else
+ * sink + group*floor((pos - sink)/group). Take recurrent/SSM checkpoints of hybrid
+ * models at such positions (see INTEGRATION_LLAMACPP.md, "Prompt caching"). */
+SJKVARN_DEF SJ_KVARN_HD uint32_t sj_kvarn_group_floor(uint32_t sink, uint32_t group, uint32_t pos);
+/* Position a truncation at pos resumes from, without changing anything: pos when
+ * pos >= B (a tail cut) or pos <= sink, else sj_kvarn_group_floor(pos). The result
+ * r satisfies pos - r <= group - 1. */
+SJKVARN_DEF uint32_t sj_kvarn_policy_trunc_floor(const sj_kvarn_policy * p, uint32_t pos);
+/* Truncate the sequence so that only positions below pos are wanted.
+ *   pos >= B: a tail cut. B is unchanged; the caller drops cells [pos, end).
+ *   pos <  B: every sealed group at or after r = trunc_floor(pos) is dropped
+ *             (B = max(sink, r)); the kept records are untouched and stay
+ *             bit-identical, because each record is a function of its own G rows.
+ * Returns r: the caller keeps positions [0, r) and re-prefills from r (r <= pos,
+ * pos - r <= group - 1, nothing is re-quantised). *n_dropped (may be NULL) gets the
+ * number of sealed groups dropped. Returns SJKVARN_NO_POS and changes nothing
+ * while a seal is pending (begin_ubatch/idle without commit). */
+SJKVARN_DEF uint32_t sj_kvarn_policy_truncate(sj_kvarn_policy * p, uint32_t pos, uint32_t * n_dropped);
 /* staging ring rows needed so that no unsealed row is overwritten */
 SJKVARN_DEF uint32_t sj_kvarn_ring_capacity(uint32_t tail, uint32_t tail_max, uint32_t group, uint32_t n_ubatch);
 SJKVARN_DEF SJ_KVARN_HD uint32_t sj_kvarn_ring_slot(uint32_t sink, uint32_t cap, uint32_t pos); /* pos >= sink */
 
 /* ---- reference per-layer cache (CPU, allocates) ---- */
+/* A layer object holds ONE sequence's rows of one attention layer (sink, staging
+ * ring, sealed records or a block-table view of a shared pool). */
 typedef struct sj_kvarn_config {
     int      head_dim;      /* D: power of two, multiple of 128 (256 is the tested size) */
     int      n_head_kv;
@@ -258,6 +301,11 @@ typedef struct sj_kvarn_layer {
     uint8_t * body;         /* [n_groups][n_head_kv][lay.bytes] */
     void    * work;
     uint16_t * kstage, * vstage; /* [G][D] fp16 seal inputs */
+    /* paged mode (sj_kvarn_seq with a pool): record (g, h) lives in block blocks[g]
+     * of this layer's pool slab, body + (blocks[g]*n_head_kv + h)*lay.bytes. NULL =
+     * contiguous own body, record (g, h) at body + (g*n_head_kv + h)*lay.bytes. */
+    const uint32_t * blocks;
+    int       owns_body;
 } sj_kvarn_layer;
 
 SJKVARN_DEF sj_kvarn_config sj_kvarn_config_default(int head_dim, int n_head_kv, uint32_t n_ctx, uint32_t n_ubatch);
@@ -273,6 +321,136 @@ SJKVARN_DEF void sj_kvarn_layer_kv_row(const sj_kvarn_layer * L, uint32_t B, uin
  * q_rot and out_rot are in the rotated basis; scale is usually 1/sqrt(D). */
 SJKVARN_DEF void sj_kvarn_layer_attend_row(const sj_kvarn_layer * L, uint32_t B, uint32_t N, const float * q_rot,
                                            int h, uint32_t qpos, float scale, float * out_rot);
+/* address of the sealed record of group g (0-based, past the sink), KV head h */
+SJKVARN_DEF uint8_t * sj_kvarn_layer_record(const sj_kvarn_layer * L, uint32_t g, int h);
+/* Optional scrub after sj_kvarn_policy_truncate: zeroes the records of groups
+ * [(B_new-sink)/G, (B_old-sink)/G) and the sink/ring rows of positions [resume, n_old)
+ * so that nothing stale can be read. Correctness does not need it (B and the stored
+ * end already exclude those bytes); the reference tests use it to prove that. */
+SJKVARN_DEF void sj_kvarn_layer_truncate(sj_kvarn_layer * L, uint32_t B_old, uint32_t B_new, uint32_t n_old, uint32_t resume);
+
+/* ---- status codes (sequences, pool, state) ---- */
+enum {
+    SJKVARN_OK                = 0,
+    SJKVARN_ERR_ARG           = -100, /* bad argument                                      */
+    SJKVARN_ERR_NOMEM         = -101,
+    SJKVARN_ERR_BUFFER        = -102, /* destination buffer too small (see state_size)      */
+    SJKVARN_ERR_TRUNCATED     = -103, /* source shorter than the stream it describes         */
+    SJKVARN_ERR_MAGIC         = -104, /* not an SJ-KVaRN sequence state                      */
+    SJKVARN_ERR_VERSION       = -105, /* state layout version not supported                  */
+    SJKVARN_ERR_FORMAT        = -106, /* record/staging byte format version differs          */
+    SJKVARN_ERR_CORRUPT       = -107, /* checksum or internal consistency failure            */
+    SJKVARN_ERR_PENDING       = -108, /* a seal is pending (B_pending != B)                   */
+    SJKVARN_ERR_CAPACITY      = -109, /* state does not fit this cache (n_ctx, ring, groups)  */
+    SJKVARN_ERR_POOL_FULL     = -110, /* no free pool block for a seal or a restore          */
+    /* configuration mismatch between a state and the restoring sequence */
+    SJKVARN_ERR_HEAD_DIM      = -120,
+    SJKVARN_ERR_N_HEAD_KV     = -121,
+    SJKVARN_ERR_GROUP         = -122,
+    SJKVARN_ERR_SINK          = -123, /* sink length or sink type                            */
+    SJKVARN_ERR_BITS          = -124,
+    SJKVARN_ERR_BODY          = -125, /* scalar vs trellis (resolved)                        */
+    SJKVARN_ERR_ITERS         = -126,
+    SJKVARN_ERR_STAGING       = -127,
+    SJKVARN_ERR_TAIL          = -128, /* tail, tail_max or flush_chunk                       */
+    SJKVARN_ERR_ROTATION      = -129,
+    SJKVARN_ERR_CODEBOOK      = -130,
+    SJKVARN_ERR_N_LAYERS      = -131
+};
+/* message for any code returned by this library (layer_init codes included) */
+SJKVARN_DEF const char * sj_kvarn_strerror(int code);
+
+/* ---- paged record pool shared by several sequences (reference) ---- */
+#define SJKVARN_NO_BLOCK UINT32_MAX
+/* A block is one sealed group (G positions) of every KV head; block b of layer il
+ * is at body + ((il*n_blocks + b)*n_head_kv + h)*lay.bytes. Sequences map their
+ * group index to a block through their own block table. */
+typedef struct sj_kvarn_pool {
+    sj_kvarn_config cfg;     /* body resolved */
+    sj_kvarn_layout lay;
+    int       n_layers;
+    uint32_t  n_blocks;
+    uint8_t * body;          /* [n_layers][n_blocks][n_head_kv][lay.bytes] */
+    uint32_t * free_ids;     /* stack of free block ids */
+    uint32_t  n_free;
+} sj_kvarn_pool;
+
+SJKVARN_DEF int      sj_kvarn_pool_init(sj_kvarn_pool * pool, const sj_kvarn_config * cfg, int n_layers, uint32_t n_blocks);
+SJKVARN_DEF void     sj_kvarn_pool_free(sj_kvarn_pool * pool);
+SJKVARN_DEF uint32_t sj_kvarn_pool_alloc(sj_kvarn_pool * pool);              /* SJKVARN_NO_BLOCK when empty */
+SJKVARN_DEF void     sj_kvarn_pool_release(sj_kvarn_pool * pool, uint32_t id);
+
+/* ---- one sequence: layers + policy + stored end (reference) ---- */
+/* pool == NULL: per-slot stream, every layer owns a contiguous body.
+ * pool != NULL: unified paged pool, records live in pool blocks named by the
+ * sequence's block table (one table for all of its layers). The ring and the sink
+ * are per sequence in both modes. Results are bit-identical between the modes. */
+typedef struct sj_kvarn_seq {
+    sj_kvarn_config  cfg;      /* body resolved */
+    int              n_layers;
+    sj_kvarn_layer * layers;   /* [n_layers] */
+    sj_kvarn_policy  pol;
+    uint32_t         n;        /* stored end: positions [0, n) are stored in every layer */
+    sj_kvarn_pool  * pool;     /* NULL = per-slot stream */
+    uint32_t       * blocks;   /* pool mode: [layers[0].n_groups] group -> block, SJKVARN_NO_BLOCK if unset */
+} sj_kvarn_seq;
+
+SJKVARN_DEF int  sj_kvarn_seq_init(sj_kvarn_seq * s, const sj_kvarn_config * cfg, int n_layers, sj_kvarn_pool * pool);
+SJKVARN_DEF void sj_kvarn_seq_free(sj_kvarn_seq * s);        /* returns its blocks to the pool */
+SJKVARN_DEF void sj_kvarn_seq_reset(sj_kvarn_seq * s);       /* empty sequence (n = 0, B = sink) */
+/* begin_ubatch + seal [B, B_pending) in every layer + commit. Call before storing
+ * the ubatch that starts at pos0 (pos0 <= n). SJKVARN_ERR_POOL_FULL leaves the
+ * sequence unchanged. */
+SJKVARN_DEF int  sj_kvarn_seq_begin_ubatch(sj_kvarn_seq * s, uint32_t pos0, uint32_t n_tokens);
+/* store position pos in every layer: k_rot/v_rot are [n_layers][n_head_kv][D] rotated
+ * floats. Positions are stored in order (pos <= n). */
+SJKVARN_DEF void sj_kvarn_seq_store(sj_kvarn_seq * s, uint32_t pos, const float * k_rot, const float * v_rot);
+/* idle step with a keep-recent margin (policy_idle + seal + commit) */
+SJKVARN_DEF int  sj_kvarn_seq_idle(sj_kvarn_seq * s, uint32_t keep_recent);
+/* policy_truncate + drop the stored end to the resume position + free dropped pool
+ * blocks + scrub. Returns the resume position or SJKVARN_NO_POS (seal pending). */
+SJKVARN_DEF uint32_t sj_kvarn_seq_truncate(sj_kvarn_seq * s, uint32_t pos);
+/* one query row of layer il, attending over [0, min(n, qpos + 1)) with the sequence's B */
+SJKVARN_DEF void sj_kvarn_seq_attend_row(const sj_kvarn_seq * s, int il, const float * q_rot, int h, uint32_t qpos,
+                                         float scale, float * out_rot);
+
+/* ---- sequence state serialization ----
+ * Stream (integers little-endian; row and record bytes exactly as stored):
+ *   header (SJKVARN_STATE_HEADER_BYTES): magic "SJKVSEQ\0", state version, format
+ *     version, header bytes, head_dim, n_head_kv, group, sink, sink_type, bits_k,
+ *     bits_v, body, iters, staging, tail, tail_max, flush_chunk, rotation id,
+ *     rotation size, codebook id (u64), n_layers, n, B, B_prev, draining,
+ *     payload bytes (u64)
+ *   payload, per layer in order:
+ *     sink rows of positions [0, min(sink, n)), [head][K | V] in the sink type
+ *     sealed records of groups [0, (B - sink)/G), [group][head], lay.bytes each
+ *     tail rows of positions [B, n), in position order, [head][K | V] staging rows
+ *   checksum: FNV-1a 64 of every byte before it (u64)
+ * The ring offset, n_ubatch and n_ctx are not stored: the restoring cache may have
+ * a different ring capacity or context as long as the state fits. */
+#define SJKVARN_STATE_HEADER_BYTES 128
+#define SJKVARN_ROTATION_HADAMARD  1   /* orthonormal Sylvester-Hadamard per head, size head_dim */
+
+typedef struct sj_kvarn_state_info {
+    uint32_t state_version, format_version;
+    sj_kvarn_config cfg;           /* stored fields; n_ctx and n_ubatch are 0 */
+    uint32_t rotation, rotation_n;
+    uint64_t codebook_id;
+    int      n_layers;
+    uint32_t n, B, B_prev, draining;
+    size_t   total_bytes;          /* header + payload + checksum */
+} sj_kvarn_state_info;
+
+/* exact bytes sj_kvarn_seq_state_write produces for the sequence as it is now */
+SJKVARN_DEF size_t sj_kvarn_seq_state_size(const sj_kvarn_seq * s);
+/* upper bound for any state of a sequence with this config (n up to n_ctx) */
+SJKVARN_DEF size_t sj_kvarn_state_size_max(const sj_kvarn_config * cfg, int n_layers);
+SJKVARN_DEF int    sj_kvarn_seq_state_write(const sj_kvarn_seq * s, void * dst, size_t dst_size, size_t * written);
+/* parse and verify a stream (magic, versions, length, checksum) without a sequence */
+SJKVARN_DEF int    sj_kvarn_state_peek(const void * src, size_t size, sj_kvarn_state_info * info);
+/* restore into s (initialised with the same config). Any config mismatch returns
+ * its SJKVARN_ERR_* code; on every error s is left unchanged. */
+SJKVARN_DEF int    sj_kvarn_seq_state_read(sj_kvarn_seq * s, const void * src, size_t size);
 
 #ifdef __cplusplus
 }
@@ -1176,15 +1354,47 @@ SJKVARN_DEF void sj_kvarn_policy_commit(sj_kvarn_policy * p) {
     p->B = p->B_pending;
 }
 
-SJKVARN_DEF uint32_t sj_kvarn_policy_idle(sj_kvarn_policy * p, uint32_t end) {
-    uint32_t target;
+/* keep_recent <= tail gives the 1.x behaviour (seal to the full flush target).
+ * A larger margin can stop short of that target; a chunked drain then stays
+ * pending, so begin_ubatch still finishes it once the margin allows. */
+SJKVARN_DEF uint32_t sj_kvarn_policy_idle(sj_kvarn_policy * p, uint32_t end, uint32_t keep_recent) {
+    uint32_t target, full;
+    int clamped = 0;
     p->B_pending = p->B;
     if (p->tail_max == 0 || end <= p->sink + p->tail) return p->B;
-    target = p->sink + p->group*((end - p->tail - p->sink)/p->group);
-    if (target <= p->B) { p->draining = 0; return p->B; }
+    full = target = p->sink + p->group*((end - p->tail - p->sink)/p->group);
+    if (keep_recent > p->tail) {
+        const uint32_t keep_from = end > keep_recent ? end - keep_recent : 0;
+        const uint32_t lim = keep_from <= p->sink ? p->sink : sj_kvarn_group_floor(p->sink, p->group, keep_from);
+        if (lim < full) { target = lim; clamped = 1; }
+    }
+    if (!clamped) p->draining = 0;
+    if (target <= p->B) return p->B;
     p->B_pending = target;
-    p->draining = 0;
     return target;
+}
+
+SJKVARN_DEF SJ_KVARN_HD uint32_t sj_kvarn_group_floor(uint32_t sink, uint32_t group, uint32_t pos) {
+    return pos <= sink ? pos : sink + group*((pos - sink)/group);
+}
+
+SJKVARN_DEF uint32_t sj_kvarn_policy_trunc_floor(const sj_kvarn_policy * p, uint32_t pos) {
+    if (pos >= p->B || pos <= p->sink) return pos;
+    return sj_kvarn_group_floor(p->sink, p->group, pos);
+}
+
+SJKVARN_DEF uint32_t sj_kvarn_policy_truncate(sj_kvarn_policy * p, uint32_t pos, uint32_t * n_dropped) {
+    uint32_t r, nb;
+    if (n_dropped) *n_dropped = 0;
+    if (p->B_pending != p->B) return SJKVARN_NO_POS;
+    r = sj_kvarn_policy_trunc_floor(p, pos);
+    if (r < p->B) {
+        nb = r > p->sink ? r : p->sink;
+        if (n_dropped) *n_dropped = (p->B - nb)/p->group;
+        p->B = p->B_prev = p->B_pending = nb;
+        p->draining = 0;
+    }
+    return r;
 }
 
 SJKVARN_DEF uint32_t sj_kvarn_ring_capacity(uint32_t tail, uint32_t tail_max, uint32_t group, uint32_t n_ubatch) {
@@ -1216,7 +1426,18 @@ SJKVARN_DEF sj_kvarn_config sj_kvarn_config_default(int head_dim, int n_head_kv,
     return c;
 }
 
+SJKVARN_DEF uint8_t * sj_kvarn_layer_record(const sj_kvarn_layer * L, uint32_t g, int h) {
+    const uint32_t blk = L->blocks ? L->blocks[g] : g;
+    return L->body + ((size_t) blk*(size_t) L->cfg.n_head_kv + (size_t) h)*L->lay.bytes;
+}
+
+static int sj_kvarn__layer_init(sj_kvarn_layer * L, const sj_kvarn_config * cfg, int own_body);
+
 SJKVARN_DEF int sj_kvarn_layer_init(sj_kvarn_layer * L, const sj_kvarn_config * cfg) {
+    return sj_kvarn__layer_init(L, cfg, 1);
+}
+
+static int sj_kvarn__layer_init(sj_kvarn_layer * L, const sj_kvarn_config * cfg, int own_body) {
     const int D = cfg->head_dim, H = cfg->n_head_kv;
     int body, rc;
     memset(L, 0, sizeof(*L));
@@ -1234,11 +1455,12 @@ SJKVARN_DEF int sj_kvarn_layer_init(sj_kvarn_layer * L, const sj_kvarn_config * 
     L->stage_bytes = sj_kvarn_stage_row_bytes(cfg->staging, D);
     L->ring = (uint8_t *) calloc((size_t) L->cap*H, 2*L->stage_bytes);
     L->sink = (uint8_t *) calloc((size_t) cfg->sink*H, 2*(cfg->sink_type == SJKVARN_SINK_F16 ? (size_t) D*2 : L->stage_bytes));
-    L->body = (uint8_t *) calloc((size_t) L->n_groups*H, L->lay.bytes);
+    L->owns_body = own_body;
+    L->body = own_body ? (uint8_t *) calloc((size_t) L->n_groups*H, L->lay.bytes) : NULL;
     L->work = malloc(sj_kvarn_seal_workspace_bytes(&L->lay));
     L->kstage = (uint16_t *) malloc((size_t) cfg->group*D*2);
     L->vstage = (uint16_t *) malloc((size_t) cfg->group*D*2);
-    if (!L->ring || !L->sink || !L->body || !L->work || !L->kstage || !L->vstage) {
+    if (!L->ring || !L->sink || (own_body && !L->body) || !L->work || !L->kstage || !L->vstage) {
         sj_kvarn_layer_free(L);
         return -11;
     }
@@ -1246,8 +1468,8 @@ SJKVARN_DEF int sj_kvarn_layer_init(sj_kvarn_layer * L, const sj_kvarn_config * 
 }
 
 SJKVARN_DEF void sj_kvarn_layer_free(sj_kvarn_layer * L) {
-    free(L->ring); free(L->sink); free(L->body); free(L->work); free(L->kstage); free(L->vstage);
-    L->ring = L->sink = L->body = NULL; L->work = NULL; L->kstage = L->vstage = NULL;
+    free(L->ring); free(L->sink); if (L->owns_body) free(L->body); free(L->work); free(L->kstage); free(L->vstage);
+    L->ring = L->sink = L->body = NULL; L->blocks = NULL; L->owns_body = 0; L->work = NULL; L->kstage = L->vstage = NULL;
 }
 
 SJKVARN_DEF void sj_kvarn_layer_store(sj_kvarn_layer * L, uint32_t pos, const float * k_rot, const float * v_rot) {
@@ -1286,7 +1508,7 @@ SJKVARN_DEF void sj_kvarn_layer_seal(sj_kvarn_layer * L, uint32_t B_from, uint32
                 for (i = 0; i < D; ++i) L->vstage[(size_t) t*D + i] = sj_kvarn_f32_to_f16(row[i]);
             }
             sj_kvarn_seal_group(&L->lay, L->kstage, L->vstage, (size_t) D, L->cfg.iters,
-                                L->body + ((size_t) g*H + h)*L->lay.bytes, L->work);
+                                sj_kvarn_layer_record(L, g, h), L->work);
         }
     }
 }
@@ -1296,7 +1518,7 @@ SJKVARN_DEF void sj_kvarn_layer_kv_row(const sj_kvarn_layer * L, uint32_t B, uin
     int i;
     if (pos >= L->cfg.sink && pos < B) {
         const uint32_t g = (pos - L->cfg.sink)/(uint32_t) G, t = (pos - L->cfg.sink)%(uint32_t) G;
-        const uint8_t * rec = L->body + ((size_t) g*H + h)*L->lay.bytes;
+        const uint8_t * rec = sj_kvarn_layer_record(L, g, h);
         sj_kvarn_decode_k_row(&L->lay, rec, (int) t, k);
         sj_kvarn_decode_v_row(&L->lay, rec, (int) t, v);
     } else if (pos < L->cfg.sink && L->cfg.sink_type == SJKVARN_SINK_F16) {
@@ -1339,6 +1561,476 @@ SJKVARN_DEF void sj_kvarn_layer_attend_row(const sj_kvarn_layer * L, uint32_t B,
         const float inv = S == 0.0f ? 0.0f : SJ__FDIV(1.0f, S);
         for (d = 0; d < D; ++d) out_rot[d] = SJ__FMUL(acc[d], inv);
     }
+}
+
+/* ---- truncation scrub ---------------------------------------------------------- */
+
+static size_t sj_kvarn__sink_row_bytes(const sj_kvarn_layer * L) {
+    /* bytes of one (position, head) sink entry: K then V */
+    return L->cfg.sink_type == SJKVARN_SINK_F16 ? (size_t) L->cfg.head_dim*4 : 2*L->stage_bytes;
+}
+
+static uint8_t * sj_kvarn__sink_row(const sj_kvarn_layer * L, uint32_t pos, int h) {
+    return L->sink + ((size_t) pos*(size_t) L->cfg.n_head_kv + (size_t) h)*sj_kvarn__sink_row_bytes(L);
+}
+
+static uint8_t * sj_kvarn__ring_row(const sj_kvarn_layer * L, uint32_t pos, int h) {
+    return L->ring + ((size_t) sj_kvarn_ring_slot(L->cfg.sink, L->cap, pos)*(size_t) L->cfg.n_head_kv + (size_t) h)*2*L->stage_bytes;
+}
+
+SJKVARN_DEF void sj_kvarn_layer_truncate(sj_kvarn_layer * L, uint32_t B_old, uint32_t B_new, uint32_t n_old, uint32_t resume) {
+    const uint32_t S = L->cfg.sink, G = (uint32_t) L->cfg.group;
+    const int H = L->cfg.n_head_kv;
+    uint32_t g, pos, from;
+    int h;
+    if (B_new < B_old) {
+        for (g = (B_new - S)/G; g < (B_old - S)/G; ++g) {
+            if (L->blocks && L->blocks[g] == SJKVARN_NO_BLOCK) continue;
+            for (h = 0; h < H; ++h) memset(sj_kvarn_layer_record(L, g, h), 0, L->lay.bytes);
+        }
+    }
+    for (pos = resume; pos < n_old && pos < S; ++pos) {
+        for (h = 0; h < H; ++h) memset(sj_kvarn__sink_row(L, pos, h), 0, sj_kvarn__sink_row_bytes(L));
+    }
+    /* ring rows of positions >= resume; only the last cap of them can still be resident.
+     * Rows the sequence keeps ([B_new, resume)) never share a slot with these: the
+     * unsealed span never exceeds the ring capacity. */
+    from = resume > S ? resume : S;
+    if (n_old > from && n_old - from > L->cap) from = n_old - L->cap;
+    for (pos = from; pos < n_old; ++pos) {
+        for (h = 0; h < H; ++h) memset(sj_kvarn__ring_row(L, pos, h), 0, 2*L->stage_bytes);
+    }
+}
+
+/* ---- status strings ------------------------------------------------------------- */
+
+SJKVARN_DEF const char * sj_kvarn_strerror(int code) {
+    switch (code) {
+        case SJKVARN_OK:              return "ok";
+        case -1:                      return "layout: head_dim must be a power of two >= 32 and group a multiple of 16";
+        case -2:                      return "layout: bits_k and bits_v must be 2, 3 or 4";
+        case -3:                      return "layout: unknown body type";
+        case -4:                      return "layout: trellis bodies need 3/3, 3/2 or 2/2 bits, group 128 and head_dim a multiple of 128";
+        case -10:                     return "config: head_dim % 128, group % 16, sink (non-zero, % 64), tail % group or tail_max invalid";
+        case -11:                     return "out of memory";
+        case SJKVARN_ERR_ARG:         return "invalid argument";
+        case SJKVARN_ERR_NOMEM:       return "out of memory";
+        case SJKVARN_ERR_BUFFER:      return "destination buffer too small for the sequence state";
+        case SJKVARN_ERR_TRUNCATED:   return "state stream is shorter than its header says";
+        case SJKVARN_ERR_MAGIC:       return "not an SJ-KVaRN sequence state (bad magic)";
+        case SJKVARN_ERR_VERSION:     return "unsupported SJ-KVaRN state version";
+        case SJKVARN_ERR_FORMAT:      return "state was written with a different record/staging byte format";
+        case SJKVARN_ERR_CORRUPT:     return "state checksum or consistency check failed";
+        case SJKVARN_ERR_PENDING:     return "a seal is pending (call commit first)";
+        case SJKVARN_ERR_CAPACITY:    return "state does not fit this cache (context, ring or group capacity)";
+        case SJKVARN_ERR_POOL_FULL:   return "record pool has no free block";
+        case SJKVARN_ERR_HEAD_DIM:    return "config mismatch: head_dim";
+        case SJKVARN_ERR_N_HEAD_KV:   return "config mismatch: n_head_kv";
+        case SJKVARN_ERR_GROUP:       return "config mismatch: group size";
+        case SJKVARN_ERR_SINK:        return "config mismatch: sink length or sink type";
+        case SJKVARN_ERR_BITS:        return "config mismatch: bits_k/bits_v";
+        case SJKVARN_ERR_BODY:        return "config mismatch: body type (scalar/trellis)";
+        case SJKVARN_ERR_ITERS:       return "config mismatch: variance-balancing iterations";
+        case SJKVARN_ERR_STAGING:     return "config mismatch: staging type";
+        case SJKVARN_ERR_TAIL:        return "config mismatch: tail, tail_max or flush_chunk";
+        case SJKVARN_ERR_ROTATION:    return "config mismatch: rotation";
+        case SJKVARN_ERR_CODEBOOK:    return "config mismatch: trellis codebook";
+        case SJKVARN_ERR_N_LAYERS:    return "config mismatch: number of layers";
+        default:                      return "unknown SJ-KVaRN status code";
+    }
+}
+
+/* ---- pool ------------------------------------------------------------------------ */
+
+SJKVARN_DEF int sj_kvarn_pool_init(sj_kvarn_pool * pool, const sj_kvarn_config * cfg, int n_layers, uint32_t n_blocks) {
+    uint32_t i;
+    int rc;
+    memset(pool, 0, sizeof(*pool));
+    if (n_layers <= 0 || n_blocks == 0 || cfg->n_head_kv <= 0) return SJKVARN_ERR_ARG;
+    pool->cfg = *cfg;
+    pool->cfg.body = sj_kvarn_body_resolve(cfg->body, cfg->bits_k, cfg->bits_v);
+    rc = sj_kvarn_layout_init(&pool->lay, cfg->head_dim, cfg->group, cfg->bits_k, cfg->bits_v, pool->cfg.body);
+    if (rc != 0) return rc;
+    pool->n_layers = n_layers;
+    pool->n_blocks = n_blocks;
+    pool->body = (uint8_t *) calloc((size_t) n_layers*n_blocks*(size_t) cfg->n_head_kv, pool->lay.bytes);
+    pool->free_ids = (uint32_t *) malloc((size_t) n_blocks*sizeof(uint32_t));
+    if (!pool->body || !pool->free_ids) { sj_kvarn_pool_free(pool); return SJKVARN_ERR_NOMEM; }
+    for (i = 0; i < n_blocks; ++i) pool->free_ids[i] = n_blocks - 1u - i; /* block 0 is handed out first */
+    pool->n_free = n_blocks;
+    return SJKVARN_OK;
+}
+
+SJKVARN_DEF void sj_kvarn_pool_free(sj_kvarn_pool * pool) {
+    free(pool->body); free(pool->free_ids);
+    pool->body = NULL; pool->free_ids = NULL; pool->n_free = 0;
+}
+
+SJKVARN_DEF uint32_t sj_kvarn_pool_alloc(sj_kvarn_pool * pool) {
+    return pool->n_free ? pool->free_ids[--pool->n_free] : SJKVARN_NO_BLOCK;
+}
+
+SJKVARN_DEF void sj_kvarn_pool_release(sj_kvarn_pool * pool, uint32_t id) {
+    if (id != SJKVARN_NO_BLOCK && pool->n_free < pool->n_blocks) pool->free_ids[pool->n_free++] = id;
+}
+
+/* ---- sequence ---------------------------------------------------------------------- */
+
+SJKVARN_DEF int sj_kvarn_seq_init(sj_kvarn_seq * s, const sj_kvarn_config * cfg, int n_layers, sj_kvarn_pool * pool) {
+    int il, rc;
+    uint32_t g;
+    memset(s, 0, sizeof(*s));
+    if (n_layers <= 0) return SJKVARN_ERR_ARG;
+    s->cfg = *cfg;
+    s->cfg.body = sj_kvarn_body_resolve(cfg->body, cfg->bits_k, cfg->bits_v);
+    if (pool) {
+        const sj_kvarn_config * pc = &pool->cfg;
+        if (pool->n_layers != n_layers || pc->head_dim != cfg->head_dim || pc->n_head_kv != cfg->n_head_kv ||
+            pc->group != cfg->group || pc->bits_k != cfg->bits_k || pc->bits_v != cfg->bits_v || pc->body != s->cfg.body) {
+            return SJKVARN_ERR_ARG;
+        }
+    }
+    s->n_layers = n_layers;
+    s->pool = pool;
+    s->layers = (sj_kvarn_layer *) calloc((size_t) n_layers, sizeof(sj_kvarn_layer));
+    if (!s->layers) return SJKVARN_ERR_NOMEM;
+    for (il = 0; il < n_layers; ++il) {
+        rc = sj_kvarn__layer_init(&s->layers[il], cfg, pool == NULL);
+        if (rc != 0) { s->n_layers = il; sj_kvarn_seq_free(s); return rc; }
+    }
+    if (pool) {
+        s->blocks = (uint32_t *) malloc((size_t) s->layers[0].n_groups*sizeof(uint32_t));
+        if (!s->blocks) { sj_kvarn_seq_free(s); return SJKVARN_ERR_NOMEM; }
+        for (g = 0; g < s->layers[0].n_groups; ++g) s->blocks[g] = SJKVARN_NO_BLOCK;
+        for (il = 0; il < n_layers; ++il) {
+            s->layers[il].body   = pool->body + (size_t) il*pool->n_blocks*(size_t) cfg->n_head_kv*pool->lay.bytes;
+            s->layers[il].blocks = s->blocks;
+        }
+    }
+    sj_kvarn_policy_init(&s->pol, cfg->sink, cfg->tail, cfg->tail_max, (uint32_t) cfg->group, cfg->flush_chunk);
+    s->n = 0;
+    return SJKVARN_OK;
+}
+
+/* pool mode: release the blocks of groups [g0, g1) */
+static void sj_kvarn__seq_release(sj_kvarn_seq * s, uint32_t g0, uint32_t g1) {
+    uint32_t g;
+    if (!s->pool || !s->blocks) return;
+    for (g = g0; g < g1 && g < s->layers[0].n_groups; ++g) {
+        sj_kvarn_pool_release(s->pool, s->blocks[g]);
+        s->blocks[g] = SJKVARN_NO_BLOCK;
+    }
+}
+
+/* pool mode: make sure groups [g0, g1) have blocks; on failure release what this call took */
+static int sj_kvarn__seq_reserve(sj_kvarn_seq * s, uint32_t g0, uint32_t g1) {
+    uint32_t g;
+    if (!s->pool) return SJKVARN_OK;
+    if (g1 > s->layers[0].n_groups) return SJKVARN_ERR_CAPACITY;
+    for (g = g0; g < g1; ++g) {
+        if (s->blocks[g] != SJKVARN_NO_BLOCK) continue;
+        s->blocks[g] = sj_kvarn_pool_alloc(s->pool);
+        if (s->blocks[g] == SJKVARN_NO_BLOCK) {
+            while (g-- > g0) { sj_kvarn_pool_release(s->pool, s->blocks[g]); s->blocks[g] = SJKVARN_NO_BLOCK; }
+            return SJKVARN_ERR_POOL_FULL;
+        }
+    }
+    return SJKVARN_OK;
+}
+
+SJKVARN_DEF void sj_kvarn_seq_free(sj_kvarn_seq * s) {
+    int il;
+    if (s->layers) {
+        if (s->pool && s->blocks) sj_kvarn__seq_release(s, 0, s->layers[0].n_groups);
+        for (il = 0; il < s->n_layers; ++il) sj_kvarn_layer_free(&s->layers[il]);
+    }
+    free(s->layers); free(s->blocks);
+    s->layers = NULL; s->blocks = NULL; s->n_layers = 0; s->n = 0;
+}
+
+SJKVARN_DEF void sj_kvarn_seq_reset(sj_kvarn_seq * s) {
+    int il;
+    for (il = 0; il < s->n_layers; ++il) sj_kvarn_layer_truncate(&s->layers[il], s->pol.B, s->cfg.sink, s->n, 0);
+    sj_kvarn__seq_release(s, 0, s->layers[0].n_groups);
+    sj_kvarn_policy_reset(&s->pol);
+    s->n = 0;
+}
+
+/* seal [B, B_pending) in every layer and commit, or undo the policy step */
+static int sj_kvarn__seq_seal_commit(sj_kvarn_seq * s, const sj_kvarn_policy * before) {
+    const uint32_t S = s->cfg.sink, G = (uint32_t) s->cfg.group;
+    int il, rc;
+    if (s->pol.B_pending > s->pol.B) {
+        rc = sj_kvarn__seq_reserve(s, (s->pol.B - S)/G, (s->pol.B_pending - S)/G);
+        if (rc != SJKVARN_OK) { s->pol = *before; return rc; }
+        for (il = 0; il < s->n_layers; ++il) sj_kvarn_layer_seal(&s->layers[il], s->pol.B, s->pol.B_pending);
+    }
+    sj_kvarn_policy_commit(&s->pol);
+    return SJKVARN_OK;
+}
+
+SJKVARN_DEF int sj_kvarn_seq_begin_ubatch(sj_kvarn_seq * s, uint32_t pos0, uint32_t n_tokens) {
+    const sj_kvarn_policy before = s->pol;
+    if (pos0 > s->n) return SJKVARN_ERR_ARG;
+    sj_kvarn_policy_begin_ubatch(&s->pol, pos0, n_tokens);
+    return sj_kvarn__seq_seal_commit(s, &before);
+}
+
+SJKVARN_DEF void sj_kvarn_seq_store(sj_kvarn_seq * s, uint32_t pos, const float * k_rot, const float * v_rot) {
+    const size_t stride = (size_t) s->cfg.n_head_kv*(size_t) s->cfg.head_dim;
+    int il;
+    for (il = 0; il < s->n_layers; ++il) {
+        sj_kvarn_layer_store(&s->layers[il], pos, k_rot + (size_t) il*stride, v_rot + (size_t) il*stride);
+    }
+    if (pos + 1u > s->n) s->n = pos + 1u;
+}
+
+SJKVARN_DEF int sj_kvarn_seq_idle(sj_kvarn_seq * s, uint32_t keep_recent) {
+    const sj_kvarn_policy before = s->pol;
+    sj_kvarn_policy_idle(&s->pol, s->n, keep_recent);
+    return sj_kvarn__seq_seal_commit(s, &before);
+}
+
+SJKVARN_DEF uint32_t sj_kvarn_seq_truncate(sj_kvarn_seq * s, uint32_t pos) {
+    const uint32_t S = s->cfg.sink, G = (uint32_t) s->cfg.group, B_old = s->pol.B, n_old = s->n;
+    uint32_t r;
+    int il;
+    r = sj_kvarn_policy_truncate(&s->pol, pos, NULL);
+    if (r == SJKVARN_NO_POS) return r;
+    for (il = 0; il < s->n_layers; ++il) sj_kvarn_layer_truncate(&s->layers[il], B_old, s->pol.B, n_old, r);
+    if (s->pol.B < B_old) sj_kvarn__seq_release(s, (s->pol.B - S)/G, (B_old - S)/G);
+    if (r < s->n) s->n = r;
+    return r;
+}
+
+SJKVARN_DEF void sj_kvarn_seq_attend_row(const sj_kvarn_seq * s, int il, const float * q_rot, int h, uint32_t qpos,
+                                         float scale, float * out_rot) {
+    sj_kvarn_layer_attend_row(&s->layers[il], s->pol.B, s->n, q_rot, h, qpos, scale, out_rot);
+}
+
+/* ---- sequence state ------------------------------------------------------------------ */
+
+static const uint8_t sj_kvarn__state_magic[8] = { 'S', 'J', 'K', 'V', 'S', 'E', 'Q', 0 };
+
+static uint64_t sj_kvarn__fnv(const uint8_t * p, size_t n, uint64_t h) {
+    size_t i;
+    for (i = 0; i < n; ++i) { h ^= p[i]; h *= UINT64_C(1099511628211); }
+    return h;
+}
+#define SJKVARN__FNV0 UINT64_C(1469598103934665603)
+
+static void sj_kvarn__put32(uint8_t * p, uint32_t v) {
+    p[0] = (uint8_t) v; p[1] = (uint8_t) (v >> 8); p[2] = (uint8_t) (v >> 16); p[3] = (uint8_t) (v >> 24);
+}
+static void sj_kvarn__put64(uint8_t * p, uint64_t v) {
+    sj_kvarn__put32(p, (uint32_t) v); sj_kvarn__put32(p + 4, (uint32_t) (v >> 32));
+}
+static uint32_t sj_kvarn__get32(const uint8_t * p) {
+    return (uint32_t) p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+}
+static uint64_t sj_kvarn__get64(const uint8_t * p) {
+    return (uint64_t) sj_kvarn__get32(p) | (uint64_t) sj_kvarn__get32(p + 4) << 32;
+}
+
+/* identity of the trellis codebooks a body uses (FNV-1a 64 of the K and V tables); 0 for scalar bodies */
+static uint64_t sj_kvarn__codebook_id(int body, int bits_k, int bits_v) {
+    uint64_t h = SJKVARN__FNV0;
+    if (body != SJKVARN_BODY_TRELLIS) return 0;
+    h = sj_kvarn__fnv((const uint8_t *) sj_kvarn__cb(bits_k, 0), (size_t) (bits_k == 3 ? 512 : 256)*2, h);
+    h = sj_kvarn__fnv((const uint8_t *) sj_kvarn__cb(bits_v, 1), (size_t) (bits_v == 3 ? 512 : 256)*2, h);
+    return h;
+}
+
+/* payload bytes of one layer for a state with stored end n and sealed end B */
+static size_t sj_kvarn__layer_payload(const sj_kvarn_config * c, const sj_kvarn_layout * lay, uint32_t n, uint32_t B) {
+    const size_t H = (size_t) c->n_head_kv;
+    const size_t sink_row = c->sink_type == SJKVARN_SINK_F16 ? (size_t) c->head_dim*4 : 2*sj_kvarn_stage_row_bytes(c->staging, c->head_dim);
+    const size_t ring_row = 2*sj_kvarn_stage_row_bytes(c->staging, c->head_dim);
+    const uint32_t n_sink = n < c->sink ? n : c->sink;
+    const uint32_t n_rec  = (B - c->sink)/(uint32_t) c->group;
+    const uint32_t n_tail = n > B ? n - B : 0;
+    return (size_t) n_sink*H*sink_row + (size_t) n_rec*H*lay->bytes + (size_t) n_tail*H*ring_row;
+}
+
+SJKVARN_DEF size_t sj_kvarn_seq_state_size(const sj_kvarn_seq * s) {
+    return SJKVARN_STATE_HEADER_BYTES + (size_t) s->n_layers*sj_kvarn__layer_payload(&s->cfg, &s->layers[0].lay, s->n, s->pol.B) + 8;
+}
+
+SJKVARN_DEF size_t sj_kvarn_state_size_max(const sj_kvarn_config * cfg, int n_layers) {
+    sj_kvarn_config c = *cfg;
+    sj_kvarn_layout lay;
+    size_t a, b;
+    uint32_t B_all;
+    c.body = sj_kvarn_body_resolve(cfg->body, cfg->bits_k, cfg->bits_v);
+    if (n_layers <= 0 || sj_kvarn_layout_init(&lay, c.head_dim, c.group, c.bits_k, c.bits_v, c.body) != 0) return 0;
+    /* the payload is linear in the number of sealed groups, so one of the two extremes is the maximum */
+    B_all = c.n_ctx > c.sink ? c.sink + (uint32_t) c.group*((c.n_ctx - c.sink + (uint32_t) c.group - 1u)/(uint32_t) c.group) : c.sink;
+    a = sj_kvarn__layer_payload(&c, &lay, c.n_ctx, c.sink);
+    b = sj_kvarn__layer_payload(&c, &lay, c.n_ctx, B_all);
+    return SJKVARN_STATE_HEADER_BYTES + (size_t) n_layers*(a > b ? a : b) + 8;
+}
+
+SJKVARN_DEF int sj_kvarn_seq_state_write(const sj_kvarn_seq * s, void * dst, size_t dst_size, size_t * written) {
+    const sj_kvarn_config * c = &s->cfg;
+    const size_t total = sj_kvarn_seq_state_size(s);
+    const uint32_t S = c->sink, G = (uint32_t) c->group, B = s->pol.B, n = s->n;
+    const int H = c->n_head_kv;
+    uint8_t * o = (uint8_t *) dst, * w;
+    uint32_t pos, g;
+    int il, h;
+    if (written) *written = 0;
+    if (!s->layers || (!dst && dst_size)) return SJKVARN_ERR_ARG;
+    if (s->pol.B_pending != s->pol.B) return SJKVARN_ERR_PENDING;
+    if (dst_size < total) return SJKVARN_ERR_BUFFER;
+    memset(o, 0, SJKVARN_STATE_HEADER_BYTES);
+    memcpy(o, sj_kvarn__state_magic, 8);
+    sj_kvarn__put32(o +   8, SJKVARN_STATE_VERSION);
+    sj_kvarn__put32(o +  12, SJKVARN_FORMAT_VERSION);
+    sj_kvarn__put32(o +  16, SJKVARN_STATE_HEADER_BYTES);
+    sj_kvarn__put32(o +  20, (uint32_t) c->head_dim);
+    sj_kvarn__put32(o +  24, (uint32_t) c->n_head_kv);
+    sj_kvarn__put32(o +  28, (uint32_t) c->group);
+    sj_kvarn__put32(o +  32, c->sink);
+    sj_kvarn__put32(o +  36, (uint32_t) c->sink_type);
+    sj_kvarn__put32(o +  40, (uint32_t) c->bits_k);
+    sj_kvarn__put32(o +  44, (uint32_t) c->bits_v);
+    sj_kvarn__put32(o +  48, (uint32_t) c->body);
+    sj_kvarn__put32(o +  52, (uint32_t) c->iters);
+    sj_kvarn__put32(o +  56, (uint32_t) c->staging);
+    sj_kvarn__put32(o +  60, c->tail);
+    sj_kvarn__put32(o +  64, c->tail_max);
+    sj_kvarn__put32(o +  68, c->flush_chunk);
+    sj_kvarn__put32(o +  72, SJKVARN_ROTATION_HADAMARD);
+    sj_kvarn__put32(o +  76, (uint32_t) c->head_dim);
+    sj_kvarn__put64(o +  80, sj_kvarn__codebook_id(c->body, c->bits_k, c->bits_v));
+    sj_kvarn__put32(o +  88, (uint32_t) s->n_layers);
+    sj_kvarn__put32(o +  92, n);
+    sj_kvarn__put32(o +  96, B);
+    sj_kvarn__put32(o + 100, s->pol.B_prev);
+    sj_kvarn__put32(o + 104, (uint32_t) s->pol.draining);
+    sj_kvarn__put64(o + 108, (uint64_t) (total - SJKVARN_STATE_HEADER_BYTES - 8));
+    w = o + SJKVARN_STATE_HEADER_BYTES;
+    for (il = 0; il < s->n_layers; ++il) {
+        const sj_kvarn_layer * L = &s->layers[il];
+        const size_t srb = sj_kvarn__sink_row_bytes(L), rrb = 2*L->stage_bytes;
+        for (pos = 0; pos < n && pos < S; ++pos) {
+            for (h = 0; h < H; ++h) { memcpy(w, sj_kvarn__sink_row(L, pos, h), srb); w += srb; }
+        }
+        for (g = 0; g < (B - S)/G; ++g) {
+            for (h = 0; h < H; ++h) { memcpy(w, sj_kvarn_layer_record(L, g, h), L->lay.bytes); w += L->lay.bytes; }
+        }
+        for (pos = B; pos < n; ++pos) {
+            for (h = 0; h < H; ++h) { memcpy(w, sj_kvarn__ring_row(L, pos, h), rrb); w += rrb; }
+        }
+    }
+    sj_kvarn__put64(w, sj_kvarn__fnv(o, (size_t) (w - o), SJKVARN__FNV0));
+    if (written) *written = total;
+    return SJKVARN_OK;
+}
+
+SJKVARN_DEF int sj_kvarn_state_peek(const void * src, size_t size, sj_kvarn_state_info * info) {
+    const uint8_t * p = (const uint8_t *) src;
+    sj_kvarn_state_info t;
+    uint64_t payload;
+    if (!src || !info) return SJKVARN_ERR_ARG;
+    memset(&t, 0, sizeof(t));
+    if (size < 8 || memcmp(p, sj_kvarn__state_magic, 8) != 0) return size < 8 ? SJKVARN_ERR_TRUNCATED : SJKVARN_ERR_MAGIC;
+    if (size < 16) return SJKVARN_ERR_TRUNCATED;
+    t.state_version  = sj_kvarn__get32(p + 8);
+    t.format_version = sj_kvarn__get32(p + 12);
+    if (t.state_version != SJKVARN_STATE_VERSION) return SJKVARN_ERR_VERSION;
+    if (size < SJKVARN_STATE_HEADER_BYTES + 8) return SJKVARN_ERR_TRUNCATED;
+    if (sj_kvarn__get32(p + 16) != SJKVARN_STATE_HEADER_BYTES) return SJKVARN_ERR_CORRUPT;
+    payload = sj_kvarn__get64(p + 108);
+    if (payload > (uint64_t) (size - SJKVARN_STATE_HEADER_BYTES - 8)) return SJKVARN_ERR_TRUNCATED;
+    t.total_bytes = SJKVARN_STATE_HEADER_BYTES + (size_t) payload + 8;
+    if (sj_kvarn__fnv(p, t.total_bytes - 8, SJKVARN__FNV0) != sj_kvarn__get64(p + t.total_bytes - 8)) return SJKVARN_ERR_CORRUPT;
+    if (t.format_version != SJKVARN_FORMAT_VERSION) return SJKVARN_ERR_FORMAT;
+    t.cfg.head_dim    = (int) sj_kvarn__get32(p + 20);
+    t.cfg.n_head_kv   = (int) sj_kvarn__get32(p + 24);
+    t.cfg.group       = (int) sj_kvarn__get32(p + 28);
+    t.cfg.sink        = sj_kvarn__get32(p + 32);
+    t.cfg.sink_type   = (int) sj_kvarn__get32(p + 36);
+    t.cfg.bits_k      = (int) sj_kvarn__get32(p + 40);
+    t.cfg.bits_v      = (int) sj_kvarn__get32(p + 44);
+    t.cfg.body        = (int) sj_kvarn__get32(p + 48);
+    t.cfg.iters       = (int) sj_kvarn__get32(p + 52);
+    t.cfg.staging     = (int) sj_kvarn__get32(p + 56);
+    t.cfg.tail        = sj_kvarn__get32(p + 60);
+    t.cfg.tail_max    = sj_kvarn__get32(p + 64);
+    t.cfg.flush_chunk = sj_kvarn__get32(p + 68);
+    t.rotation        = sj_kvarn__get32(p + 72);
+    t.rotation_n      = sj_kvarn__get32(p + 76);
+    t.codebook_id     = sj_kvarn__get64(p + 80);
+    t.n_layers        = (int) sj_kvarn__get32(p + 88);
+    t.n               = sj_kvarn__get32(p + 92);
+    t.B               = sj_kvarn__get32(p + 96);
+    t.B_prev          = sj_kvarn__get32(p + 100);
+    t.draining        = sj_kvarn__get32(p + 104);
+    *info = t;
+    return SJKVARN_OK;
+}
+
+SJKVARN_DEF int sj_kvarn_seq_state_read(sj_kvarn_seq * s, const void * src, size_t size) {
+    const sj_kvarn_config * c = &s->cfg;
+    const uint8_t * r;
+    sj_kvarn_state_info t;
+    uint32_t S, G, n_rec, pos, g, held = 0;
+    int il, h, rc;
+    if (!s->layers) return SJKVARN_ERR_ARG;
+    rc = sj_kvarn_state_peek(src, size, &t);
+    if (rc != SJKVARN_OK) return rc;
+    /* configuration: everything that changes stored bytes or the policy must match */
+    if (t.cfg.head_dim != c->head_dim)                                   return SJKVARN_ERR_HEAD_DIM;
+    if (t.cfg.n_head_kv != c->n_head_kv)                                 return SJKVARN_ERR_N_HEAD_KV;
+    if (t.cfg.group != c->group)                                         return SJKVARN_ERR_GROUP;
+    if (t.cfg.sink != c->sink || t.cfg.sink_type != c->sink_type)        return SJKVARN_ERR_SINK;
+    if (t.cfg.bits_k != c->bits_k || t.cfg.bits_v != c->bits_v)          return SJKVARN_ERR_BITS;
+    if (t.cfg.body != c->body)                                           return SJKVARN_ERR_BODY;
+    if (t.cfg.iters != c->iters)                                         return SJKVARN_ERR_ITERS;
+    if (t.cfg.staging != c->staging)                                     return SJKVARN_ERR_STAGING;
+    if (t.cfg.tail != c->tail || t.cfg.tail_max != c->tail_max || t.cfg.flush_chunk != c->flush_chunk) return SJKVARN_ERR_TAIL;
+    if (t.rotation != SJKVARN_ROTATION_HADAMARD || t.rotation_n != (uint32_t) c->head_dim) return SJKVARN_ERR_ROTATION;
+    if (t.codebook_id != sj_kvarn__codebook_id(c->body, c->bits_k, c->bits_v)) return SJKVARN_ERR_CODEBOOK;
+    if (t.n_layers != s->n_layers)                                       return SJKVARN_ERR_N_LAYERS;
+    /* internal consistency of the policy state */
+    S = c->sink; G = (uint32_t) c->group;
+    if (t.B < S || (t.B - S) % G != 0 || t.B_prev < S || t.B_prev > t.B || (t.B_prev - S) % G != 0 ||
+        t.draining > 1 || (t.B > S && t.B > t.n)) {
+        return SJKVARN_ERR_CORRUPT;
+    }
+    if (t.total_bytes != SJKVARN_STATE_HEADER_BYTES + (size_t) s->n_layers*sj_kvarn__layer_payload(c, &s->layers[0].lay, t.n, t.B) + 8) {
+        return SJKVARN_ERR_CORRUPT;
+    }
+    /* capacity of this cache */
+    n_rec = (t.B - S)/G;
+    if (t.n > c->n_ctx || n_rec > s->layers[0].n_groups || (t.n > t.B && t.n - t.B > s->layers[0].cap)) return SJKVARN_ERR_CAPACITY;
+    if (s->pool) {
+        for (g = 0; g < s->layers[0].n_groups; ++g) held += s->blocks[g] != SJKVARN_NO_BLOCK;
+        if (s->pool->n_free + held < n_rec) return SJKVARN_ERR_POOL_FULL;
+    }
+    /* accepted: replace the sequence */
+    sj_kvarn_seq_reset(s);
+    if (sj_kvarn__seq_reserve(s, 0, n_rec) != SJKVARN_OK) return SJKVARN_ERR_POOL_FULL; /* not reached: checked above */
+    r = (const uint8_t *) src + SJKVARN_STATE_HEADER_BYTES;
+    for (il = 0; il < s->n_layers; ++il) {
+        sj_kvarn_layer * L = &s->layers[il];
+        const size_t srb = sj_kvarn__sink_row_bytes(L), rrb = 2*L->stage_bytes;
+        for (pos = 0; pos < t.n && pos < S; ++pos) {
+            for (h = 0; h < c->n_head_kv; ++h) { memcpy(sj_kvarn__sink_row(L, pos, h), r, srb); r += srb; }
+        }
+        for (g = 0; g < n_rec; ++g) {
+            for (h = 0; h < c->n_head_kv; ++h) { memcpy(sj_kvarn_layer_record(L, g, h), r, L->lay.bytes); r += L->lay.bytes; }
+        }
+        for (pos = t.B; pos < t.n; ++pos) {
+            for (h = 0; h < c->n_head_kv; ++h) { memcpy(sj_kvarn__ring_row(L, pos, h), r, rrb); r += rrb; }
+        }
+    }
+    s->pol.B = s->pol.B_pending = t.B;
+    s->pol.B_prev = t.B_prev;
+    s->pol.draining = (int) t.draining;
+    s->n = t.n;
+    return SJKVARN_OK;
 }
 
 #ifdef __cplusplus

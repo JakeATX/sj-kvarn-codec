@@ -103,15 +103,64 @@ steps (and CUDA graph capture keeps working). Only the descriptor values change.
    - If it returns `B_pending > B`, add one `seal_dyn` node per layer ahead of that
      layer's K/V write. It is safe because it reads only positions below `pos0`.
    - After the graph runs, call `sj_kvarn_policy_commit`.
-5. Idle: an optional server hook calls `sj_kvarn_policy_idle` and runs a seal-only graph.
-6. Unsupported for now, rejected at init with a clear message:
-   - sequence copy or removal in the middle of the cache (`seq_rm` other than truncating
-     back into the tail)
-   - multiple sequences per cache
-   - context shift
+5. Idle: a server hook calls `sj_kvarn_policy_idle(&pol, n, keep_recent)` and runs a
+   seal-only graph when it returns `B_pending > B`. Pass `keep_recent = n - keep_from`,
+   where `keep_from` is the absolute position where the last prompt ended (llama-server
+   knows it per slot). That keeps the last generated turn in the exact tail, where the
+   next request usually re-renders it.
+6. Unsupported, rejected with a clear message: removal in the middle of a sequence
+   (`seq_rm(seq, p0, p1)` with `p1` before the end), `seq_add`/`seq_div` (context shift)
+   on sealed positions.
 
-   Truncating back into the tail is cheap, because it only moves `N`. Truncating below
-   `B` needs a re-seal, or a reset of that sequence.
+### 4a. Prompt caching (required)
+
+llama-server reuses the common prefix of consecutive requests (`cache_prompt`, on by
+default) and saves/restores slots (`--slot-save-path`, `/slots`). A cache that does not
+support these is not usable in a server, so all of the following are part of the
+integration, not extras.
+
+1. **Truncation (`seq_rm(seq, p, -1)`).** Map it to `sj_kvarn_policy_truncate(&pol, p,
+   &n_dropped)`:
+   - `p >= B`: drop tail cells `[p, end)`; the cache keeps everything before `p`.
+   - `sink < p < B`: the cache keeps `[0, r)` with
+     `r = sink + G*floor((p - sink)/G)` and drops every sealed group from `r` on.
+     `seq_rm` must report that it removed `[r, end)`, so that the server re-prefills from
+     `r` (at most 127 positions more than asked). In llama.cpp terms: `seq_pos_max` drops to
+     `r - 1` and the server's `n_past` follows it.
+   - `p <= sink`: drop all groups, keep `[0, p)` (the sink is exact).
+   - Nothing is re-quantised. Kept records are bit-identical, because each 128-token
+     record is a function of its own group's rows only, and the re-prefilled groups seal
+     to the same bytes a fresh prefill would produce.
+   - Refuse (return false) while a seal is pending; `sj_kvarn_policy_truncate` returns
+     `SJKVARN_NO_POS` in that state. The fork's `seq_rm` does the same.
+2. **Idle margin.** As item 5 above. Without it, an idle step can seal the last answer,
+   and the next request's edit to it then costs a full group of re-prefill per edit.
+3. **State save/restore (`state_write`/`state_read`, slot save, `/slots` restore).**
+   Write, per sequence, the config identity (G, sink, bits K/V, body type, iterations,
+   staging type, tail, tail_max, flush_chunk, head_dim, n_head_kv, rotation and codebook),
+   the policy state (`n`, `B`, `B_prev`, `draining`), and then per layer the sink rows, the
+   records of groups `[0, (B - S)/G)` and the tail rows `[B, n)` in position order. Reject a
+   mismatch on read before changing any state. The codec's `sj_kvarn_seq_state_write`/
+   `_read` is a reference for this; the byte layout inside a GGUF session file may differ,
+   but the checks should not. The ring offset is derived from positions, so a state
+   restores into a context with a different `n_ubatch`.
+4. **Aligned checkpoints for hybrid models.** For a model with recurrent layers (Qwen3.5
+   GDN, Mamba hybrids), take the recurrent-state checkpoints that llama-server uses for
+   prefix reuse at group-aligned positions (`sj_kvarn_group_floor(S, G, pos)`), or at
+   positions `<= S`. A truncation then lands exactly on a checkpoint. Otherwise the server
+   has to fall back to the earlier of the attention cut and the nearest checkpoint.
+5. **Multiple sequences.** All policy and buffer state is per sequence. Two modes:
+   - *Per-slot streams* (`kv_unified = false`): one ring, sink, body and policy per
+     sequence (stream). The ops are unchanged; each stream is its own view.
+   - *Unified paged pool* (`kv_unified = true`): one record pool per layer in blocks of
+     one group of all KV heads, plus a per-sequence block table (group index to block id),
+     allocated at seal time and freed on truncation. `seal_dyn` and the region-aware FA
+     take the block table as an extra source and resolve record `(g, h)` at
+     `body + (blocks[g]*n_head_kv + h)*rec_bytes`. Sink and ring stay per sequence.
+     `sj_kvarn_pool`/`sj_kvarn_seq` in the codec are the reference, with a test that two
+     interleaved sequences give the same bytes and outputs as each alone.
+   - `seq_cp` of a sealed prefix between sequences can share blocks only with reference
+     counts; the reference pool does not do this, so copy the records.
 
 ## 5. Tests for the PR
 
@@ -121,3 +170,8 @@ steps (and CUDA graph capture keeps working). Only the descriptor values change.
   - region-aware FA (against `sj_kvarn_layer_attend_row`, tolerance 1e-5 relative)
 - A perplexity or KL comparison against an fp16 cache at a context past `sink + tail_max`,
   so that the body is actually used.
+- Prompt caching: truncation at `p` above and below `B`, at and across group boundaries,
+  then a re-prefill; the result must match a fresh prefill of the same tokens byte for
+  byte. State save/restore round trips for each body config, and rejection of each
+  config mismatch.
+- Two sequences in one unified cache give the same outputs as each alone.

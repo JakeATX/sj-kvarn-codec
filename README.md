@@ -30,9 +30,10 @@ What the repository provides:
 
 | File | Contents |
 |---|---|
-| `sj_kvarn.h` | Single-header C99 library (stb style): formats, rotation, seal (encode), decode, `tq6_0` staging, the adaptive-tail policy, a reference per-layer cache and a reference attention loop. Needs only `libm`. |
+| `sj_kvarn.h` | Single-header C99 library (stb style): formats, rotation, seal (encode), decode, `tq6_0` staging, the adaptive-tail policy (with truncation and an idle margin for prompt caching), a reference per-layer cache, a per-sequence cache (`sj_kvarn_seq`) with versioned state save/restore, a paged record pool shared by several sequences, and a reference attention loop. Needs only `libm`. |
 | `sj_kvarn_cuda.cuh` | CUDA reference kernels for seal, decode, staging and attention. They compile the same codec source for the device and produce the same bytes. They are written for correctness, not speed. |
-| `tests/` | Bit-exactness vectors, policy, KL and fp16 tests (plain C99), a CUDA device-vs-host test, and harnesses that compare against a llama.cpp tree carrying the SJ-KVaRN cache (llamAmpere). |
+| `tests/` | Bit-exactness vectors, policy, KL, fp16 and state/truncation/multi-sequence tests (plain C99), a CUDA device-vs-host test, and harnesses that compare against a llama.cpp tree carrying the SJ-KVaRN cache (llamAmpere). |
+| `CHANGELOG.md` | Changes by library version. |
 | `INTEGRATION_LLAMACPP.md` | Sketch of the ggml type and op registration for a llama.cpp pull request. |
 
 ## Which version this is
@@ -372,14 +373,22 @@ Attention covers three regions:
 - `[B, N)` is read from the ring.
 
 **6. Optional idle step.** When the engine has nothing to do, compress a tail that has
-grown:
+grown. Pass a keep-recent margin so that the region a client is likely to edit stays in
+the exact tail (for a chat server: everything after the end of the last prompt, which the
+next request usually re-renders):
 
 ```c
-if (sj_kvarn_policy_idle(&pol, n_stored) > pol.B) { /* seal [B, B_pending) on all layers */ sj_kvarn_policy_commit(&pol); }
+uint32_t keep = n_stored - last_prompt_end;          // 0 = just the configured tail
+if (sj_kvarn_policy_idle(&pol, n_stored, keep) > pol.B) { /* seal [B, B_pending) on all layers */ sj_kvarn_policy_commit(&pol); }
 ```
+
+The idle step never seals the last `max(keep, tail)` positions.
 
 **7. Reset.** On a sequence reset, call `sj_kvarn_policy_reset(&pol)`. The ring and the
 body are overwritten as positions come back in.
+
+**8. Prompt caching.** See the next section: truncate with `sj_kvarn_policy_truncate`,
+save and restore with the `sj_kvarn_seq_state_*` functions.
 
 For a production kernel, replace the reference attention with a flash-attention variant
 that reads the three regions in place. The fp32 reference loop is there so you can check
@@ -387,11 +396,103 @@ your kernel's output against it. The record decoders `sj_kvarn_decode_k_row` and
 `sj_kvarn_decode_v_row`, and the score and accumulate helpers `sj_kvarn_record_scores`
 and `sj_kvarn_record_accum_v`, give you the exact values a kernel must reproduce.
 
+## Prompt caching and multiple sequences
+
+All cache and policy objects are **per sequence**. `sj_kvarn_seq` bundles what one
+sequence owns: one `sj_kvarn_layer` per attention layer (sink, staging ring, records),
+one `sj_kvarn_policy` and the stored end `n`. The functions below are reference
+implementations, written for correctness; speed work on these paths is planned for v0.6
+(see [Limitations](#limitations)).
+
+### Truncation
+
+A server that reuses a cached prompt keeps the common prefix and drops the rest.
+`sj_kvarn_policy_truncate(&pol, p, &n_dropped)` (or `sj_kvarn_seq_truncate(&seq, p)`)
+handles both cases:
+
+| Cut `p` | What happens | Resume from |
+|---|---|---|
+| `p >= B` (in the tail) | `B` is unchanged; tail cells `[p, end)` are dropped. | `p` |
+| `sink < p < B` (in the body) | Every sealed group at and after `r = sink + G*floor((p - sink)/G)` is dropped; `B = r`. | `r` (at most `G - 1` = 127 positions before `p`) |
+| `p <= sink` | Every sealed group is dropped; `B = sink`. The sink is exact, so the cut is exact. | `p` |
+
+The caller keeps positions `[0, r)` and re-prefills from `r`. Nothing is re-quantised and
+nothing is re-sealed: the kept records stay **bit-identical**, because each 128-token
+record (group, head) is computed from that group's own G rows only. The variance
+balancing, the per-row and per-channel scales and the trellis path all run inside the
+tile, so no record depends on any position outside its group. Dropping trailing groups
+therefore cannot change the groups in front of them. When the re-prefilled positions are
+sealed later, they produce exactly the bytes a fresh prefill of the same tokens would
+(tested in `tests/test_state.c`, including an edited suffix).
+
+`sj_kvarn_policy_trunc_floor(&pol, p)` returns `r` without changing anything. The call
+returns `SJKVARN_NO_POS` and changes nothing while a seal is pending (between
+`begin_ubatch` and `commit`).
+
+**Hybrid models (attention + recurrent/SSM layers).** A recurrent state cannot be cut; it
+is restored from a checkpoint. Take those checkpoints at group-aligned positions
+(`sj_kvarn_group_floor(sink, G, pos)`): then the attention cut `r` and the recurrent
+restore point coincide, and a truncation never has to re-prefill further back than the
+checkpoint. A checkpoint at a position `c <= sink` or `c >= B` is reachable as it is.
+
+### Idle margin
+
+`sj_kvarn_policy_idle(&pol, end, keep_recent)` seals no further than the group boundary
+at or below `end - max(keep_recent, tail)`. With `keep_recent = end - last_prompt_end`,
+idle compression never seals the turn generated after the last prompt. When the client
+sends that turn back re-rendered (different whitespace, tool-call formatting, a trimmed
+thinking block), the cut lands in the exact tail and costs nothing beyond the edited
+tokens.
+
+### State save and restore
+
+```c
+size_t n = sj_kvarn_seq_state_size(&seq);            // exact size now; sj_kvarn_state_size_max() bounds it
+int rc = sj_kvarn_seq_state_write(&seq, buf, n, &written);
+...
+rc = sj_kvarn_seq_state_read(&other_seq, buf, n);   // other_seq: same config, any ring size or n_ctx that fits
+if (rc != SJKVARN_OK) fprintf(stderr, "%s\n", sj_kvarn_strerror(rc));
+```
+
+The stream holds a 128-byte header (magic `SJKVSEQ`, state version, record format version,
+G, sink and sink type, bits K/V, resolved body type, iterations, staging type, tail,
+tail_max, flush_chunk, head_dim, n_head_kv, rotation identity, trellis codebook identity,
+layer count, and the policy state `n`, `B`, `B_prev`, `draining`), then per layer the sink
+rows, the sealed records and the tail rows in position order, then an FNV-1a 64 checksum.
+Row and record bytes are copied exactly as stored. `sj_kvarn_seq_state_read` checks the
+stream before it touches the sequence and returns a distinct code for each mismatch
+(`SJKVARN_ERR_HEAD_DIM`, `_N_HEAD_KV`, `_GROUP`, `_SINK`, `_BITS`, `_BODY`, `_ITERS`,
+`_STAGING`, `_TAIL`, `_ROTATION`, `_CODEBOOK`, `_N_LAYERS`), for a damaged stream
+(`_MAGIC`, `_VERSION`, `_FORMAT`, `_TRUNCATED`, `_CORRUPT`) and for a stream that does not
+fit (`_CAPACITY`, `_POOL_FULL`). On any error the sequence is left unchanged. The ring
+offset, `n_ubatch` and `n_ctx` are not stored, so a state can be restored into a cache
+with a different ring capacity or context as long as it fits. A state must be written
+between ubatches (`SJKVARN_ERR_PENDING` otherwise). `sj_kvarn_state_peek` parses and
+verifies a stream without a sequence.
+
+### Multiple sequences
+
+Two integration modes, both tested to give bit-identical bytes and outputs:
+
+- **Per-slot streams.** Each sequence (server slot) gets its own `sj_kvarn_seq`: its own
+  sink, ring, contiguous body and policy. Simple, and the memory of an idle slot is
+  reserved.
+- **Unified paged pool.** `sj_kvarn_pool` holds the records of all sequences in blocks
+  (one block = one sealed group of every KV head, per layer). Each sequence keeps a block
+  table, group index to block id, and allocates blocks as it seals and frees them on
+  truncation. Attention reads record `(g, h)` at `body + (blocks[g]*n_head_kv + h)*rec_bytes`
+  (`sj_kvarn_layer_record`). Sink and ring stay per sequence. Pass the pool to
+  `sj_kvarn_seq_init`; everything else is the same calls.
+
+`tests/test_state.c` runs two sequences through one pool, interleaved, with a truncation
+that returns blocks which the other sequence then reuses, and checks that both give the
+same state bytes and attention outputs as when each runs alone.
+
 ## Tests and bit-exactness
 
 | Command | What it checks |
 |---|---|
-| `make check` | C99 build with `-std=c99 -Wall -Wextra -Wpedantic -Werror`. Also runs fp16 conversion, 21 bit-exact vectors (D = 128 and 256, 10 body configs, plus `tq6_0`), 6.7 million policy steps and the KL sanity test. |
+| `make check` (or `make test`) | C99 build with `-std=c99 -Wall -Wextra -Wpedantic -Werror`. Also runs fp16 conversion, 21 bit-exact vectors (D = 128 and 256, 10 body configs, plus `tq6_0`), 8.4 million policy steps with about 21,700 random truncations and idle margins, the KL sanity test, and `tests/test_state` (truncation, state round trips, mismatch rejection, idle margin, pool vs alone, golden state hashes; about 2.5 minutes, most of it trellis seals). |
 | `tests/build_tree_harness.sh <tree> <build>` then `tests/tree_harness [--kvd FILE]` | Runs a llama.cpp tree's own ggml CPU graph next to this library through the adaptive-tail schedule with a wrapping ring, and compares every byte. |
 | `tests/build_tree_harness.sh <tree> <build> cuda` then `tests/tree_cuda_harness` | Runs the tree's own CUDA staging and seal kernels and compares the bytes with this library. |
 | `tests/build_cuda_test.sh` then `tests/test_cuda` | Compares device and host on seal records, decode, staging and attention. |
@@ -490,9 +591,21 @@ None of these change the bytes of the formats that are included.
   kernels can be much faster.
 - **CUDA kernels.** They use one thread per record or per row. They exist to check the
   format on the device, not to run fast.
-- **Sequences.** One sequence per cache: the policy tracks a single position stream.
-  Multi-sequence batching needs one policy and one set of ring and body buffers per
-  sequence.
+- **Prompt caching and multiple sequences are reference paths.** Truncation, the idle
+  margin, state save/restore and the paged pool are written for correctness and tested
+  for bit-exactness, not for speed. Serialization copies row by row on the CPU, the pool
+  allocates one block at a time, and attention resolves one position at a time through
+  the block table.
+- **Context shift and middle removal.** Removing positions from the middle of a sequence
+  or shifting it (RoPE re-rotation of sealed records) is not supported. Only truncation
+  of a suffix is.
+
+**Planned (v0.6): performance** of the prompt-caching and multi-sequence paths:
+
+- a fused multi-sequence attention kernel that walks the block table (paged attention over records)
+- batched truncation across sequences and layers (one pass to free blocks and scrub)
+- asynchronous state serialization (device-to-host copies overlapped with decoding, streamed per layer)
+- block allocation in batches per commit, and GPU kernels for state copy-in/copy-out
 - **Model coverage.** The trellis codebooks are fixed trained tables. Any model decodes
   correctly, but the quality results above were measured on Qwen3.8 27B only.
 - **Group size.** `G` is fixed at 128 for trellis bodies. Head dimension must be a multiple
