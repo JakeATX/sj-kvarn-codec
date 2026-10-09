@@ -1,16 +1,16 @@
 // Bit-exactness harness: runs the reference ggml CPU graph of a llama.cpp tree that carries the SJ-KVaRN cache (llamAmpere)
-// (turbo_wht rotation -> set_rows_tq6_rotated staging with fp16 sink -> kvarn_seal_dyn -> flash_attn_ext with
+// (turbo_wht rotation -> set_rows_tq6_rotated staging with fp16 sink -> sj_kvarn_seal_dyn -> flash_attn_ext with
 // the SJ-KVaRN region descriptor) next to sj_kvarn.h, through the real adaptive-tail schedule, and compares bytes.
 //
 // Build: tests/build_tree_harness.sh <tree root> <tree build dir>
 // Run:   tests/tree_harness [--kvd FILE] [--kvd-groups N] [--vectors OUT]
 //
-// The tree's own header (ggml-kvarn.h) is compiled into this file with -ffp-contract=off for the decode
+// The tree's own header (ggml-sjkvarn.h) is compiled into this file with -ffp-contract=off for the decode
 // comparison; the seal, staging and attention results come from the tree's shared libraries unchanged.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "ggml-kvarn.h"
+#include "ggml-sjkvarn.h"
 
 #define SJ_KVARN_IMPLEMENTATION
 #include "../sj_kvarn.h"
@@ -129,7 +129,7 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
     const uint32_t cap = L.cap;
 
     // ---- tree cache tensors
-    const ggml_kvarn::layout tl = ggml_kvarn::make_layout(D, G, c.bk, c.bv);
+    const ggml_sj_kvarn::layout tl = ggml_sj_kvarn::make_layout(D, G, c.bk, c.bv);
     const size_t row_bytes = ggml_row_size(GGML_TYPE_TQ6_0, (int64_t) D*HKV);
     const size_t sink_rows = ((size_t) S*HKV*D*2 + row_bytes - 1)/row_bytes;
     const int64_t n_rows = S + cap + sink_rows;
@@ -162,20 +162,20 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
         }
         res.policy_bad += pend != tB_pending;
         const uint32_t B_old = pol.B;
-        // seal: tree (kvarn_seal_dyn on the ring) and ours
-        int32_t desc_v[GGML_KVARN_DESC_N_ENTRIES] = {0};
-        desc_v[GGML_KVARN_DESC_S] = S; desc_v[GGML_KVARN_DESC_CAP] = cap;
-        desc_v[GGML_KVARN_DESC_G] = G; desc_v[GGML_KVARN_DESC_D] = D;
-        desc_v[GGML_KVARN_DESC_RECBYTES] = tl.bytes; desc_v[GGML_KVARN_DESC_HKV] = HKV;
-        desc_v[GGML_KVARN_DESC_TYPE_K] = GGML_TYPE_TQ6_0; desc_v[GGML_KVARN_DESC_TYPE_V] = GGML_TYPE_TQ6_0;
-        desc_v[GGML_KVARN_DESC_BODY_TYPE] = body_type == GGML_TYPE_I16 ? GGML_TYPE_I16 : 0;
-        desc_v[GGML_KVARN_DESC_SINK_TYPE] = GGML_TYPE_F16;
+        // seal: tree (sj_kvarn_seal_dyn on the ring) and ours
+        int32_t desc_v[GGML_SJKVARN_DESC_N_ENTRIES] = {0};
+        desc_v[GGML_SJKVARN_DESC_S] = S; desc_v[GGML_SJKVARN_DESC_CAP] = cap;
+        desc_v[GGML_SJKVARN_DESC_G] = G; desc_v[GGML_SJKVARN_DESC_D] = D;
+        desc_v[GGML_SJKVARN_DESC_RECBYTES] = tl.bytes; desc_v[GGML_SJKVARN_DESC_HKV] = HKV;
+        desc_v[GGML_SJKVARN_DESC_TYPE_K] = GGML_TYPE_TQ6_0; desc_v[GGML_SJKVARN_DESC_TYPE_V] = GGML_TYPE_TQ6_0;
+        desc_v[GGML_SJKVARN_DESC_BODY_TYPE] = body_type == GGML_TYPE_I16 ? GGML_TYPE_I16 : 0;
+        desc_v[GGML_SJKVARN_DESC_SINK_TYPE] = GGML_TYPE_F16;
         if (pend > B_old) {
             ggml_context * ctx = mk_ctx(16 << 20);
-            ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
-            desc_v[GGML_KVARN_DESC_B_OLD] = B_old; desc_v[GGML_KVARN_DESC_B] = pend;
+            ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+            desc_v[GGML_SJKVARN_DESC_B_OLD] = B_old; desc_v[GGML_SJKVARN_DESC_B] = pend;
             memcpy(desc->data, desc_v, sizeof(desc_v));
-            ggml_tensor * s = ggml_kvarn_seal_dyn(ctx, body, kc, vc, desc, D, G, c.bk, c.bv, 16, (int32_t) ((pend - B_old)/G));
+            ggml_tensor * s = ggml_sj_kvarn_seal_dyn(ctx, body, kc, vc, desc, D, G, c.bk, c.bv, 16, (int32_t) ((pend - B_old)/G));
             run(ctx, s, 8);
             ggml_free(ctx);
             sj_kvarn_layer_seal(&L, B_old, pend);
@@ -195,8 +195,8 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
                     std::vector<float> ta(D), tb(D);
                     for (int t = 0; t < G; ++t) {
                         for (int isv = 0; isv < 2; ++isv) {
-                            if (isv) { ggml_kvarn::decode_v_row(a, tl, t, ta.data(), c.body == SJKVARN_BODY_TRELLIS); sj_kvarn_decode_v_row(&L.lay, a, t, tb.data()); }
-                            else     { ggml_kvarn::decode_k_row(a, tl, t, ta.data(), c.body == SJKVARN_BODY_TRELLIS); sj_kvarn_decode_k_row(&L.lay, a, t, tb.data()); }
+                            if (isv) { ggml_sj_kvarn::decode_v_row(a, tl, t, ta.data(), c.body == SJKVARN_BODY_TRELLIS); sj_kvarn_decode_v_row(&L.lay, a, t, tb.data()); }
+                            else     { ggml_sj_kvarn::decode_k_row(a, tl, t, ta.data(), c.body == SJKVARN_BODY_TRELLIS); sj_kvarn_decode_k_row(&L.lay, a, t, tb.data()); }
                             res.dec_rows++;
                             res.dec_bad += memcmp(ta.data(), tb.data(), D*4) != 0;
                         }
@@ -249,9 +249,9 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
         {
             const uint32_t N = pos0 + n;
             ggml_context * ctx = mk_ctx(64 << 20);
-            ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
-            desc_v[GGML_KVARN_DESC_B_OLD] = B_old; desc_v[GGML_KVARN_DESC_B] = pol.B;
-            desc_v[GGML_KVARN_DESC_N] = N; desc_v[GGML_KVARN_DESC_QPOS0] = pos0;
+            ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+            desc_v[GGML_SJKVARN_DESC_B_OLD] = B_old; desc_v[GGML_SJKVARN_DESC_B] = pol.B;
+            desc_v[GGML_SJKVARN_DESC_N] = N; desc_v[GGML_SJKVARN_DESC_QPOS0] = pos0;
             memcpy(desc->data, desc_v, sizeof(desc_v));
             ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n, HQ);
             for (uint32_t i = 0; i < n; ++i)
@@ -261,7 +261,7 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
             ggml_tensor * vv = ggml_view_3d(ctx, vc, D, S + cap, HKV, row_bytes, ggml_row_size(GGML_TYPE_TQ6_0, D), 0);
             const float scale = 1.0f/sqrtf((float) D);
             ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, kv, vv, nullptr, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_kvarn(fa, body, desc, c.bk, c.bv, (int32_t) GGML_PAD(N, 64));
+            ggml_flash_attn_ext_set_sj_kvarn(fa, body, desc, c.bk, c.bv, (int32_t) GGML_PAD(N, 64));
             run(ctx, fa, 8);
             std::vector<float> mine(D);
             for (uint32_t i = 0; i < n; ++i) {
@@ -354,11 +354,11 @@ int main(int argc, char ** argv) {
         for (const cfg_t & c : CONFIGS) {
             long bad = 0;
             for (const kvd_group & g : gs) {
-                const ggml_kvarn::layout tl = ggml_kvarn::make_layout(g.D, g.G, c.bk, c.bv);
+                const ggml_sj_kvarn::layout tl = ggml_sj_kvarn::make_layout(g.D, g.G, c.bk, c.bv);
                 sj_kvarn_layout l;
                 if (sj_kvarn_layout_init(&l, g.D, g.G, c.bk, c.bv, c.body) != 0) { bad++; continue; }
                 std::vector<uint8_t> a(tl.bytes), b(l.bytes), work(sj_kvarn_seal_workspace_bytes(&l));
-                ggml_kvarn::seal_group((const ggml_fp16_t *) g.K.data(), (const ggml_fp16_t *) g.V.data(), g.D, tl, 16, a.data(), c.body == SJKVARN_BODY_TRELLIS);
+                ggml_sj_kvarn::seal_group((const ggml_fp16_t *) g.K.data(), (const ggml_fp16_t *) g.V.data(), g.D, tl, 16, a.data(), c.body == SJKVARN_BODY_TRELLIS);
                 sj_kvarn_seal_group(&l, g.K.data(), g.V.data(), g.D, 16, b.data(), work.data());
                 bad += a != b;
             }
@@ -376,14 +376,14 @@ int main(int argc, char ** argv) {
             std::vector<uint16_t> K((size_t) D*128), V((size_t) D*128);
             sjv_fill_group(D, 128, 1, K.data(), V.data());
             for (const cfg_t & c : CONFIGS) {
-                const ggml_kvarn::layout tl = ggml_kvarn::make_layout(D, 128, c.bk, c.bv);
+                const ggml_sj_kvarn::layout tl = ggml_sj_kvarn::make_layout(D, 128, c.bk, c.bv);
                 std::vector<uint8_t> a(tl.bytes);
-                ggml_kvarn::seal_group((const ggml_fp16_t *) K.data(), (const ggml_fp16_t *) V.data(), D, tl, 16, a.data(), c.body == SJKVARN_BODY_TRELLIS);
+                ggml_sj_kvarn::seal_group((const ggml_fp16_t *) K.data(), (const ggml_fp16_t *) V.data(), D, tl, 16, a.data(), c.body == SJKVARN_BODY_TRELLIS);
                 uint64_t hd = 1469598103934665603ULL;
                 std::vector<float> row(D);
                 for (int t = 0; t < 128; ++t) {
-                    ggml_kvarn::decode_k_row(a.data(), tl, t, row.data(), c.body == SJKVARN_BODY_TRELLIS); hd = fnv(row.data(), D*4, hd);
-                    ggml_kvarn::decode_v_row(a.data(), tl, t, row.data(), c.body == SJKVARN_BODY_TRELLIS); hd = fnv(row.data(), D*4, hd);
+                    ggml_sj_kvarn::decode_k_row(a.data(), tl, t, row.data(), c.body == SJKVARN_BODY_TRELLIS); hd = fnv(row.data(), D*4, hd);
+                    ggml_sj_kvarn::decode_v_row(a.data(), tl, t, row.data(), c.body == SJKVARN_BODY_TRELLIS); hd = fnv(row.data(), D*4, hd);
                 }
                 fprintf(f, "seal D=%d bk=%d bv=%d body=%d bytes=%zu rec=%016" PRIx64 " dec=%016" PRIx64 "\n", D, c.bk, c.bv, c.body, (size_t) tl.bytes, fnv(a.data(), a.size()), hd);
             }

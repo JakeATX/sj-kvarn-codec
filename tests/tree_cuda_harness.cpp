@@ -1,5 +1,5 @@
 // Bit-exactness harness against a llama.cpp tree's CUDA kernels: the tree's CUDA set_rows_tq6_rotated (staging
-// ring + fp16 sink) and kvarn_seal_dyn (sealer) run on the GPU through ggml-backend; the bytes are compared with
+// ring + fp16 sink) and sj_kvarn_seal_dyn (sealer) run on the GPU through ggml-backend; the bytes are compared with
 // sj_kvarn.h on the host. Two ubatches with a wrapping ring and a seal before each, for every body config.
 // Staging rows are compared as stored. A staging row that differs is then replaced by this library's row, so
 // the record check measures the sealer on identical input. (ggml-cuda builds with -use_fast_math and sums the
@@ -116,16 +116,16 @@ res_t run_cfg(ggml_backend_t be, const cfg_t & c, uint64_t seed) {
         const uint32_t target = pos0 > S ? S + G*((pos0 - S)/G) : S;
         if (target > B) {
             graph_ctx g;
-            ggml_tensor * desc = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
-            ggml_tensor * s = ggml_kvarn_seal_dyn(g.ctx, body, kc, vc, desc, D, G, c.bk, c.bv, 16, (int32_t) ((target - B)/G));
+            ggml_tensor * desc = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+            ggml_tensor * s = ggml_sj_kvarn_seal_dyn(g.ctx, body, kc, vc, desc, D, G, c.bk, c.bv, 16, (int32_t) ((target - B)/G));
             g.alloc(be);
-            int32_t dv[GGML_KVARN_DESC_N_ENTRIES] = {0};
-            dv[GGML_KVARN_DESC_S] = S; dv[GGML_KVARN_DESC_CAP] = CAP; dv[GGML_KVARN_DESC_G] = G; dv[GGML_KVARN_DESC_D] = D;
-            dv[GGML_KVARN_DESC_RECBYTES] = (int32_t) rec_bytes; dv[GGML_KVARN_DESC_HKV] = HKV;
-            dv[GGML_KVARN_DESC_TYPE_K] = GGML_TYPE_TQ6_0; dv[GGML_KVARN_DESC_TYPE_V] = GGML_TYPE_TQ6_0;
-            dv[GGML_KVARN_DESC_BODY_TYPE] = body_type == GGML_TYPE_I16 ? GGML_TYPE_I16 : 0;
-            dv[GGML_KVARN_DESC_SINK_TYPE] = GGML_TYPE_F16;
-            dv[GGML_KVARN_DESC_B_OLD] = (int32_t) B; dv[GGML_KVARN_DESC_B] = (int32_t) target; dv[GGML_KVARN_DESC_N] = (int32_t) pos0;
+            int32_t dv[GGML_SJKVARN_DESC_N_ENTRIES] = {0};
+            dv[GGML_SJKVARN_DESC_S] = S; dv[GGML_SJKVARN_DESC_CAP] = CAP; dv[GGML_SJKVARN_DESC_G] = G; dv[GGML_SJKVARN_DESC_D] = D;
+            dv[GGML_SJKVARN_DESC_RECBYTES] = (int32_t) rec_bytes; dv[GGML_SJKVARN_DESC_HKV] = HKV;
+            dv[GGML_SJKVARN_DESC_TYPE_K] = GGML_TYPE_TQ6_0; dv[GGML_SJKVARN_DESC_TYPE_V] = GGML_TYPE_TQ6_0;
+            dv[GGML_SJKVARN_DESC_BODY_TYPE] = body_type == GGML_TYPE_I16 ? GGML_TYPE_I16 : 0;
+            dv[GGML_SJKVARN_DESC_SINK_TYPE] = GGML_TYPE_F16;
+            dv[GGML_SJKVARN_DESC_B_OLD] = (int32_t) B; dv[GGML_SJKVARN_DESC_B] = (int32_t) target; dv[GGML_SJKVARN_DESC_N] = (int32_t) pos0;
             ggml_backend_tensor_set(desc, dv, 0, sizeof(dv));
             compute(be, g.ctx, s);
             sj_kvarn_layer_seal(&L, B, target);

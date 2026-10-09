@@ -91,7 +91,7 @@ steps (and CUDA graph capture keeps working). Only the descriptor values change.
 ## 4. `llama-kv-cache`
 
 1. Config:
-   - `llama_kvarn_config {enabled, bits_k, bits_v, body, sink = 128, tail = 4096, tail_max = 8192, flush_chunk = 0, iters = 16}`
+   - `llama_sj_kvarn_config {enabled, bits_k, bits_v, body, sink = 128, tail = 4096, tail_max = 8192, flush_chunk = 0, iters = 16}`
    - CLI flags: `--sjkvarn-bits K/V`, `--sjkvarn-tail N`, `--sjkvarn-tail-max N` (0 = fixed tail)
 2. Allocation per layer:
    - `k`/`v` tensors of `S + cap` rows in `TQ6_0`, where `cap = sj_kvarn_ring_capacity(tail, tail_max, 128, n_ubatch)`

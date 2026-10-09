@@ -533,7 +533,7 @@ None of these change the bytes of the formats that are included.
 
 ## License
 
-MIT. See `LICENSE` and the end of `sj_kvarn.h`.
+MIT. See `LICENSE` and the end of `sj_kvarn.h`. `NOTICE` credits the KVarN method (huawei-csl, Apache-2.0).
 
 The quantization method of the sealed body comes from KVarN by huawei-csl
 (https://github.com/huawei-csl/KVarN), which is licensed under Apache-2.0. This
