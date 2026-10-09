@@ -5,6 +5,8 @@ SJ-KVaRN is a compressed KV-cache format for transformer inference. The name sta
 official repository ([huawei-csl/KVarN](https://github.com/huawei-csl/KVarN)), and
 **SJ-KVaRN** means the format in this repository.
 
+The paper, with the full method and measurements: [SJ-KVaRN on Hugging Face](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper).
+
 - **Staged.** Each new K/V row is first written to a staging ring in `tq6_0`, a 6-bit
   format with one fp16 norm per 128 values (6.125 bits per element). For recent tokens,
   attention reads straight from this ring.
