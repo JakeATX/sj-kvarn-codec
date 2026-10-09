@@ -15,6 +15,6 @@ check: all
 	./tests/test_kl
 
 clean:
-	rm -f $(TESTS) tests/tree_harness tests/test_cuda
+	rm -f $(TESTS) tests/tree_harness tests/tree_cuda_harness tests/test_cuda
 
 .PHONY: all check clean

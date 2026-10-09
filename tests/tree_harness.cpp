@@ -1,6 +1,6 @@
-// Bit-exactness harness: runs the reference ggml CPU graph of a llama.cpp tree that carries the KVarN cache
+// Bit-exactness harness: runs the reference ggml CPU graph of a llama.cpp tree that carries the SJ-KVaRN cache (llamAmpere)
 // (turbo_wht rotation -> set_rows_tq6_rotated staging with fp16 sink -> kvarn_seal_dyn -> flash_attn_ext with
-// the KVarN region descriptor) next to sj_kvarn.h, through the real adaptive-tail schedule, and compares bytes.
+// the SJ-KVaRN region descriptor) next to sj_kvarn.h, through the real adaptive-tail schedule, and compares bytes.
 //
 // Build: tests/build_tree_harness.sh <tree root> <tree build dir>
 // Run:   tests/tree_harness [--kvd FILE] [--kvd-groups N] [--vectors OUT]
@@ -245,7 +245,7 @@ result_t run_cache(const cfg_t & c, uint64_t seed, bool verbose) {
             }
         }
 
-        // attend: tree flash_attn_ext (KVarN reference, causal without mask) vs ours, rotated basis
+        // attend: tree flash_attn_ext (SJ-KVaRN reference, causal without mask) vs ours, rotated basis
         {
             const uint32_t N = pos0 + n;
             ggml_context * ctx = mk_ctx(64 << 20);

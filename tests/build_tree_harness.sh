@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the bit-exactness harnesses against a llama.cpp tree that carries the KVarN cache (read-only use of the tree).
+# Build the bit-exactness harnesses against a llama.cpp tree that carries the SJ-KVaRN cache (llamAmpere) (read-only use of the tree).
 # usage: tests/build_tree_harness.sh <tree root> <tree build dir with bin/libggml-*.so> [cuda]
 #   default: tests/tree_harness (tree CPU graph); with "cuda": tests/tree_cuda_harness (tree CUDA kernels)
 set -e
